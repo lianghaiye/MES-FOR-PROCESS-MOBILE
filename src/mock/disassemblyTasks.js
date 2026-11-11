@@ -1,0 +1,1664 @@
+import {
+  getEbomByKey,
+  initEbomExecutionState,
+  calcDisassemblyStats,
+  flattenLeafNodes,
+  initQcDisplayState,
+} from '@/mock/disassemblyEbom'
+import { generateLinesFromSyncedTasks } from '@/mock/reportConfirmStore'
+import {
+  getTaskAssignGroups,
+  isMultiGroupTask,
+} from '@/utils/processReportTaskRules'
+import { getGroupLeaderName } from '@/mock/employeeGroups'
+import { isParallelTaskDispatch } from '@/utils/businessRuleBridge'
+
+const STORAGE_KEY = 'i_doms_mobile_disassembly_tasks'
+const DRAFT_KEY = 'i_doms_mobile_disassembly_drafts'
+const RESULT_KEY = 'i_doms_disassembly_results'
+const SYNC_KEY = 'i_doms_disassembly_pc_sync'
+const MOBILE_TASK_SYNC_KEY = 'i_doms_mobile_tasks_sync'
+const INBOUND_KEY = 'i_doms_disassembly_inbound'
+const SCRAP_MGMT_KEY = 'i_doms_disassembly_scrap_mgmt'
+const WO_STATUS_KEY = 'i_doms_disassembly_wo_status'
+
+export const warehouseOptions = ['半成品仓', '成品仓', '原料仓', '报废品仓']
+
+/** 任务状态 */
+export const taskStatusOptions = ['待领取', '待分发', '待报工', '待开始', '执行中', '已完成']
+
+/** 拆解工艺路线工序（一张工单拆成多条任务） */
+const DISASSEMBLY_PROCESSES = ['拆解', '拆解质检', '入库']
+
+function formatTaskDate(d = new Date()) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+const seedTasks = [
+  // 工单1：一批一码 — 拆解待分发
+  taskSeed({
+    id: 'dt-001',
+    workOrderId: 'dwo-m-1',
+    workOrderCode: 'CJGD20260602001',
+    workOrderName: '测试质检一批一码拆解001',
+    taskNo: 'T20260602001',
+    processName: '拆解',
+    processSeq: 1,
+    productName: '测试质检一批一码',
+    itemCode: 'CP-QC-BATCH-01',
+    specModel: '一批一码',
+    barcodeType: '一批一码',
+    processRoute: '拆解标准路线',
+    executor: 'admin',
+    groupName: '加工小组',
+    expectedQty: 5,
+    taskStatus: '待分发',
+    ebomKey: 'ebom-batch-qc',
+    createdAt: '2026-06-02 09:00:00',
+  }),
+  // 工单2：一类一码 — 拆解待开始
+  taskSeed({
+    id: 'dt-002',
+    workOrderId: 'dwo-m-2',
+    workOrderCode: 'CJGD20260602002',
+    workOrderName: '清水离心泵拆解001',
+    taskNo: 'T20260602002',
+    processName: '拆解',
+    processSeq: 1,
+    productName: '清水离心泵',
+    itemCode: 'CP2610001',
+    specModel: '一类一码',
+    barcodeType: '一类一码',
+    processRoute: '机加标准路线',
+    executor: '张三',
+    groupName: '机加小组',
+    expectedQty: 1,
+    taskStatus: '待开始',
+    ebomKey: 'ebom-centrifugal',
+    createdAt: '2026-06-02 10:30:00',
+  }),
+  // 工单3：一物一码 — 拆解执行中
+  taskSeed({
+    id: 'dt-003',
+    workOrderId: 'dwo-m-3',
+    workOrderCode: 'CJGD20260602003',
+    workOrderName: '污水泵拆解001',
+    taskNo: 'T20260602003',
+    processName: '拆解',
+    processSeq: 1,
+    productName: '污水泵',
+    itemCode: 'CP2610002',
+    specModel: 'ISG80-160(I)A',
+    barcodeType: '一物一码',
+    serialNo: 'SN-WB-20260602001',
+    processRoute: '装配标准路线',
+    executor: '孙琴丽',
+    groupName: '总装小组',
+    expectedQty: 1,
+    taskStatus: '执行中',
+    ebomKey: 'ebom-sewage-pump',
+    createdAt: '2026-06-02 11:00:00',
+    startedAt: '2026-06-02 14:00:00',
+  }),
+  // 工单3 — 拆解质检执行中
+  taskSeed({
+    id: 'dt-004',
+    workOrderId: 'dwo-m-3',
+    workOrderCode: 'CJGD20260602003',
+    workOrderName: '污水泵拆解001',
+    taskNo: 'T20260602004',
+    processName: '拆解质检',
+    processSeq: 2,
+    productName: '污水泵',
+    itemCode: 'CP2610002',
+    specModel: 'ISG80-160(I)A',
+    barcodeType: '一物一码',
+    serialNo: 'SN-WB-20260602001',
+    processRoute: '装配标准路线',
+    executor: '李质检',
+    groupName: '质检小组',
+    expectedQty: 1,
+    taskStatus: '执行中',
+    ebomKey: 'ebom-sewage-pump',
+    createdAt: '2026-06-02 15:00:00',
+  }),
+  // 工单3 — 拆解质检待开始（便于测试）
+  taskSeed({
+    id: 'dt-008',
+    workOrderId: 'dwo-m-3',
+    workOrderCode: 'CJGD20260602003',
+    workOrderName: '污水泵拆解001',
+    taskNo: 'T20260602008',
+    processName: '拆解质检',
+    processSeq: 2,
+    productName: '污水泵',
+    itemCode: 'CP2610002',
+    specModel: 'ISG80-160(I)A',
+    barcodeType: '一物一码',
+    serialNo: 'SN-WB-20260602001',
+    processRoute: '装配标准路线',
+    executor: '李质检',
+    groupName: '质检小组',
+    expectedQty: 1,
+    taskStatus: '待开始',
+    ebomKey: 'ebom-sewage-pump',
+    createdAt: '2026-06-03 09:00:00',
+  }),
+  // 工单4 — 入库已完成
+  taskSeed({
+    id: 'dt-005',
+    workOrderId: 'dwo-m-4',
+    workOrderCode: 'CJGD20260601005',
+    workOrderName: '立式多级泵拆解001',
+    taskNo: 'T20260601005',
+    processName: '入库',
+    processSeq: 3,
+    productName: '立式多级泵',
+    itemCode: 'CP2610003',
+    specModel: 'CDL4-40',
+    barcodeType: '一批一码',
+    processRoute: '装配标准路线',
+    executor: '李四',
+    groupName: '装配小组',
+    expectedQty: 1,
+    taskStatus: '已完成',
+    ebomKey: 'ebom-multi-stage',
+    createdAt: '2026-06-01 08:00:00',
+    finishedAt: '2026-06-01 17:30:00',
+  }),
+  // 工单4 — 拆解已完成（历史）
+  taskSeed({
+    id: 'dt-006',
+    workOrderId: 'dwo-m-4',
+    workOrderCode: 'CJGD20260601005',
+    workOrderName: '立式多级泵拆解001',
+    taskNo: 'T20260601006',
+    processName: '拆解',
+    processSeq: 1,
+    productName: '立式多级泵',
+    itemCode: 'CP2610003',
+    specModel: 'CDL4-40',
+    barcodeType: '一批一码',
+    processRoute: '装配标准路线',
+    executor: '李四',
+    groupName: '装配小组',
+    expectedQty: 1,
+    taskStatus: '已完成',
+    ebomKey: 'ebom-multi-stage',
+    createdAt: '2026-06-01 08:00:00',
+    finishedAt: '2026-06-01 12:00:00',
+  }),
+  // —— 生产工单任务（工序报工） ——
+  taskSeed({
+    id: 'pt-001',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-1',
+    workOrderCode: 'WO-062',
+    workOrderName: '货架支架生产工单',
+    taskNo: 'T20260602011',
+    processName: '点焊',
+    processSeq: 1,
+    productName: '货架支架',
+    itemCode: 'SJ-2024-A',
+    specModel: '1200×600mm',
+    barcodeType: '一批一码',
+    processRoute: '标准焊接工艺 v2',
+    executor: '张三',
+    groupName: '焊接小组',
+    expectedQty: 25,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:00:00`,
+  }),
+  taskSeed({
+    id: 'pt-002',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-1',
+    workOrderCode: 'WO-062',
+    workOrderName: '货架支架生产工单',
+    taskNo: 'T20260602012',
+    processName: '打磨',
+    processSeq: 2,
+    productName: '货架支架',
+    itemCode: 'SJ-2024-A',
+    specModel: '1200×600mm',
+    barcodeType: '一批一码',
+    processRoute: '标准焊接工艺 v2',
+    executor: '张三',
+    groupName: '焊接小组',
+    expectedQty: 25,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:10:00`,
+  }),
+  taskSeed({
+    id: 'pt-003',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-1',
+    workOrderCode: 'WO-062',
+    workOrderName: '货架支架生产工单',
+    taskNo: 'T20260602013',
+    processName: '装配',
+    processSeq: 3,
+    productName: '货架支架',
+    itemCode: 'SJ-2024-A',
+    specModel: '1200×600mm',
+    barcodeType: '一批一码',
+    processRoute: '标准焊接工艺 v2',
+    executor: '张三',
+    groupName: '加工小组',
+    expectedQty: 25,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: true,
+    createdAt: `${formatTaskDate()} 08:20:00`,
+  }),
+  taskSeed({
+    id: 'pt-004',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-2',
+    workOrderCode: 'WO-058',
+    workOrderName: '泵轴生产工单',
+    taskNo: 'T20260602014',
+    processName: '车削',
+    processSeq: 1,
+    productName: '泵轴',
+    itemCode: 'BX-2024-03',
+    specModel: 'Φ50×L800 45#',
+    barcodeType: '一批一码',
+    processRoute: '车铣加工路线',
+    executor: '张三',
+    groupName: '加工小组',
+    expectedQty: 20,
+    taskStatus: '执行中',
+    placement: 'todo',
+    serialLocked: false,
+    reportStatus: '待审核',
+    reportedGoodQty: 14,
+    reportedDefectQty: 1,
+    createdAt: `${formatTaskDate()} 09:00:00`,
+  }),
+  taskSeed({
+    id: 'pt-005',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-2',
+    workOrderCode: 'WO-058',
+    workOrderName: '泵轴生产工单',
+    taskNo: 'T20260602015',
+    processName: '铣削',
+    processSeq: 2,
+    productName: '泵轴',
+    itemCode: 'BX-2024-03',
+    specModel: 'Φ50×L800 45#',
+    barcodeType: '一批一码',
+    processRoute: '车铣加工路线',
+    executor: '张三',
+    groupName: '加工小组',
+    expectedQty: 15,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 09:15:00`,
+  }),
+  taskSeed({
+    id: 'pt-006',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-3',
+    workOrderCode: 'WO-055',
+    workOrderName: '泵壳生产工单',
+    taskNo: 'T20260602016',
+    processName: '热处理',
+    processSeq: 1,
+    productName: '泵壳',
+    itemCode: 'BK-2024-01',
+    specModel: 'HT200 铸铁',
+    barcodeType: '一批一码',
+    processRoute: '铸造加工路线',
+    executor: '张三',
+    groupName: '加工小组',
+    expectedQty: 12,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 10:00:00`,
+  }),
+  // —— 工时工资演示：三种报工×计薪（今日待报工） ——
+  taskSeed({
+    id: 'pt-wage-1',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-01',
+    workOrderCode: 'WO-LH-01',
+    workOrderName: '工时演示-批量计件计件',
+    taskNo: 'TLH20260601001',
+    processName: '机加工',
+    processSeq: 1,
+    productName: '工时演示-批量计件计件',
+    itemCode: 'LH-MAT-01',
+    specModel: '演示物料A',
+    salesOrderNo: '1-20260606-101',
+    barcodeType: '一批一码',
+    processRoute: '工时演示路线-计件',
+    executor: '张三',
+    groupName: '加工小组',
+    expectedQty: 20,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:00:00`,
+  }),
+  taskSeed({
+    id: 'pt-wage-2',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-02',
+    workOrderCode: 'WO-LH-02',
+    workOrderName: '工时演示-批量计件计时',
+    taskNo: 'TLH20260601002',
+    processName: '领料',
+    processSeq: 1,
+    productName: '工时演示-批量计件计时',
+    itemCode: 'LH-MAT-02',
+    specModel: '演示物料B',
+    salesOrderNo: '1-20260606-102',
+    barcodeType: '一批一码',
+    processRoute: '工时演示路线-计时',
+    executor: '张三',
+    groupName: '加工小组',
+    expectedQty: 30,
+    taskStatus: '执行中',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:15:00`,
+  }),
+  taskSeed({
+    id: 'pt-wage-3',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-03',
+    workOrderCode: 'WO-LH-03',
+    workOrderName: '工时演示-时长报工计时',
+    taskNo: 'TLH20260601003',
+    processName: '调试',
+    processSeq: 1,
+    productName: '工时演示-时长报工计时',
+    itemCode: 'LH-MAT-03',
+    specModel: '演示物料C',
+    salesOrderNo: '1-20260606-103',
+    barcodeType: '一批一码',
+    processRoute: '工时演示路线-时长',
+    executor: '张三',
+    groupName: '加工小组',
+    expectedQty: 1,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:30:00`,
+  }),
+  taskSeed({
+    id: 'pt-wage-4',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-04',
+    workOrderCode: 'WO-LH-04',
+    workOrderName: '电机轴套生产工单',
+    taskNo: 'TLH20260601004',
+    processName: '粗车',
+    processSeq: 1,
+    productName: '电机轴套',
+    itemCode: 'CP2510001',
+    specModel: 'Φ80×120',
+    salesOrderNo: '1-20260606-104',
+    barcodeType: '一批一码',
+    processRoute: '机加标准路线',
+    executor: '张三',
+    groupName: '机加小组',
+    expectedQty: 18,
+    taskStatus: '待开始',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:45:00`,
+  }),
+  taskSeed({
+    id: 'pt-wage-5',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-05',
+    workOrderCode: 'WO-LH-05',
+    workOrderName: '离心泵总成生产工单',
+    taskNo: 'TLH20260601005',
+    processName: '轴承装配',
+    processSeq: 2,
+    productName: '离心泵总成',
+    itemCode: 'CP2510002',
+    specModel: 'ISG65-160',
+    salesOrderNo: '1-20260606-105',
+    barcodeType: '一批一码',
+    processRoute: '装配标准路线',
+    executor: '张三',
+    groupName: '总装小组',
+    expectedQty: 10,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:05:00`,
+  }),
+  taskSeed({
+    id: 'pt-wage-6',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-06',
+    workOrderCode: 'WO-LH-06',
+    workOrderName: '立式多级泵生产工单',
+    taskNo: 'TLH20260601006',
+    processName: '入库',
+    processSeq: 4,
+    productName: '立式多级泵',
+    itemCode: 'CP2510003',
+    specModel: 'CDL4-40',
+    salesOrderNo: '1-20260606-106',
+    barcodeType: '一批一码',
+    processRoute: '装配标准路线',
+    executor: '张三',
+    groupName: '装配小组',
+    expectedQty: 1,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:25:00`,
+  }),
+  taskSeed({
+    id: 'pt-wage-7',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-07',
+    workOrderCode: 'WO-LH-07',
+    workOrderName: '立式多级泵生产工单',
+    taskNo: 'TLH20260601007',
+    processName: '预装',
+    processSeq: 2,
+    productName: '立式多级泵',
+    itemCode: 'CP2510003',
+    specModel: 'CDL4-40',
+    salesOrderNo: '1-20260606-106',
+    barcodeType: '一批一码',
+    processRoute: '装配标准路线',
+    executor: '张三',
+    groupName: '装配小组',
+    expectedQty: 8,
+    taskStatus: '执行中',
+    placement: 'todo',
+    serialLocked: false,
+    reportedGoodQty: 3,
+    reportedDefectQty: 0,
+    createdAt: `${formatTaskDate()} 08:35:00`,
+  }),
+  // —— 多人执行 · 待领取（工序报工） ——
+  taskSeed({
+    id: 'pt-claim-1',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-4',
+    workOrderCode: 'WO-071',
+    workOrderName: '法兰盘生产工单',
+    taskNo: 'T20260602021',
+    processName: '点焊',
+    processSeq: 1,
+    productName: '法兰盘',
+    itemCode: 'FL-2024-C',
+    specModel: 'DN150 PN16',
+    material: 'HT200',
+    drawingNo: 'FL-DN150-01',
+    barcodeType: '一批一码',
+    processRoute: '标准焊接工艺 v2',
+    executor: '',
+    executors: ['张三', '王五'],
+    claimTargets: ['张三', '王五'],
+    groupName: '焊接小组',
+    expectedQty: 20,
+    taskStatus: '待领取',
+    placement: 'claim',
+    resourceType: '工人',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:30:00`,
+  }),
+  taskSeed({
+    id: 'pt-claim-2',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-5',
+    workOrderCode: 'WO-068',
+    workOrderName: '深井潜水泵生产工单',
+    taskNo: 'T20260602022',
+    processName: '精车',
+    processSeq: 2,
+    productName: '深井潜水泵',
+    itemCode: 'CP2610004',
+    specModel: 'QJ200-50/4',
+    material: '不锈钢304',
+    drawingNo: 'QJ200-50/4-DWG',
+    barcodeType: '一批一码',
+    processRoute: '机加标准路线',
+    executor: '',
+    executors: ['李四', '赵六'],
+    claimTargets: ['李四', '赵六'],
+    groupName: '机加小组',
+    expectedQty: 8,
+    taskStatus: '待领取',
+    placement: 'claim',
+    resourceType: '工人',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:15:00`,
+  }),
+  taskSeed({
+    id: 'pt-claim-3',
+    orderCategory: '总装工单',
+    workOrderId: 'wo-asm-1',
+    workOrderCode: 'WO-ZZ-012',
+    workOrderName: '污水泵总装工单',
+    taskNo: 'T20260602023',
+    processName: '总装',
+    processSeq: 1,
+    productName: '污水泵',
+    itemCode: 'CP2610002',
+    specModel: 'ISG80-160(I)A',
+    material: 'HT250',
+    drawingNo: 'ISG80-160-DWG',
+    barcodeType: '一批一码',
+    processRoute: '装配标准路线',
+    executor: '',
+    executors: ['张三', '李四'],
+    claimTargets: ['张三', '李四'],
+    groupName: '总装小组',
+    expectedQty: 6,
+    taskStatus: '待领取',
+    placement: 'claim',
+    resourceType: '工人',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:45:00`,
+  }),
+  taskSeed({
+    id: 'pt-leader-1',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-leader-1',
+    workOrderCode: 'WO-058',
+    workOrderName: '泵轴生产工单',
+    taskNo: 'T20260602017',
+    processName: '精车',
+    processSeq: 1,
+    productName: '泵轴',
+    itemCode: 'BX-2024-03',
+    specModel: 'Φ50×L800 45#',
+    barcodeType: '一批一码',
+    processRoute: '车铣加工路线',
+    executor: '张三',
+    groupName: '加工小组',
+    resourceType: '工人',
+    expectedQty: 18,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:00:00`,
+  }),
+  taskSeed({
+    id: 'pt-group-1',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-7',
+    workOrderCode: 'WO-072',
+    workOrderName: '深井潜水泵生产工单',
+    taskNo: 'T20260602025',
+    processName: '磨削',
+    processSeq: 1,
+    productName: '深井潜水泵',
+    itemCode: 'CP2610004',
+    specModel: 'QJ200-50/4',
+    barcodeType: '一批一码',
+    processRoute: '机加标准路线',
+    executor: '',
+    executors: ['张三', '李四', '赵六'],
+    groupName: '加工小组',
+    resourceType: '工人小组',
+    expectedQty: 100,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:20:00`,
+  }),
+  taskSeed({
+    id: 'pt-claim-multi',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-8',
+    workOrderCode: 'WO-071',
+    workOrderName: '法兰盘生产工单',
+    taskNo: 'T20260602026',
+    processName: '喷涂',
+    processSeq: 1,
+    productName: '法兰盘',
+    itemCode: 'FL-2024-C',
+    specModel: 'DN150 PN16',
+    material: 'HT200',
+    drawingNo: 'FL-DN150-01',
+    barcodeType: '一批一码',
+    processRoute: '表面处理路线',
+    executor: '',
+    groupName: '加工小组',
+    groupNames: ['加工小组', '焊接小组'],
+    resourceType: '工人小组',
+    expectedQty: 30,
+    taskStatus: '待领取',
+    placement: 'claim',
+    claimedGroups: [],
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 07:40:00`,
+  }),
+  // —— 多人协作（工人小组 + 时长报工）——
+  taskSeed({
+    id: 'pt-collab-1',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-collab-1',
+    workOrderCode: 'WO-20260813-007',
+    workOrderName: '潜水泵生产工单',
+    taskNo: 'T20260813071',
+    processName: '试验',
+    processSeq: 7,
+    productName: '潜水泵',
+    itemCode: '21.01.02.03.005',
+    specModel: 'QDX3-20-0.55',
+    material: '铸铁',
+    drawingNo: '20260813-007',
+    barcodeType: '一批一码',
+    processRoute: '泵装配试验路线',
+    executor: '',
+    executors: ['张三', '李四', '赵六'],
+    groupName: '加工小组',
+    resourceType: '工人小组',
+    reportMode: '时长报工',
+    taskExecutionMode: 'collaborative',
+    laborCalcMethod: '时长报工+计时工资',
+    expectedQty: 1,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:10:00`,
+  }),
+  taskSeed({
+    id: 'pt-collab-2',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-collab-2',
+    workOrderCode: 'WO-20260820-012',
+    workOrderName: '离心泵调试工单',
+    taskNo: 'T20260820012',
+    processName: '调试',
+    processSeq: 4,
+    productName: '离心泵',
+    itemCode: 'CP-LX-2024-08',
+    specModel: 'IS80-65-160',
+    material: 'HT200',
+    drawingNo: 'LX-080-01',
+    barcodeType: '一批一码',
+    processRoute: '泵调试路线',
+    executor: '',
+    executors: ['张三', '李四', '赵六'],
+    groupName: '加工小组',
+    resourceType: '工人小组',
+    reportMode: '时长报工',
+    taskExecutionMode: 'collaborative',
+    laborCalcMethod: '时长报工+计时工资',
+    expectedQty: 2,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 08:25:00`,
+  }),
+  taskSeed({
+    id: 'pt-collab-3',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-collab-3',
+    workOrderCode: 'WO-20260820-015',
+    workOrderName: '电机出厂检验工单',
+    taskNo: 'T20260820015',
+    processName: '检验',
+    processSeq: 5,
+    productName: '三相异步电机',
+    itemCode: 'DJ-Y2-132',
+    specModel: 'Y2-132M-4',
+    material: '铸铝',
+    drawingNo: 'DJ-132-04',
+    barcodeType: '一批一码',
+    processRoute: '电机检验路线',
+    executor: '',
+    executors: ['张三', '李四', '赵六'],
+    groupName: '加工小组',
+    resourceType: '工人小组',
+    reportMode: '时长报工',
+    taskExecutionMode: 'collaborative',
+    laborCalcMethod: '时长报工+计时工资',
+    expectedQty: 3,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 09:00:00`,
+  }),
+  taskSeed({
+    id: 'pt-collab-4',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-collab-4',
+    workOrderCode: 'WO-20260820-018',
+    workOrderName: '上导轴承座热处理工单',
+    taskNo: 'T20260820018',
+    processName: '热处理',
+    processSeq: 2,
+    productName: '上导轴承座',
+    itemCode: 'CP2510002',
+    specModel: 'Φ320',
+    material: '45#',
+    drawingNo: 'ZC-320-02',
+    barcodeType: '一批一码',
+    processRoute: '热处理标准路线',
+    executor: '',
+    executors: ['张三', '李四', '赵六'],
+    groupName: '加工小组',
+    resourceType: '工人小组',
+    reportMode: '时长报工',
+    taskExecutionMode: 'collaborative',
+    laborCalcMethod: '时长报工+计时工资',
+    expectedQty: 5,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    createdAt: `${formatTaskDate()} 09:20:00`,
+  }),
+  // 工单5 — 深井泵拆解待开始
+  taskSeed({
+    id: 'dt-007',
+    workOrderId: 'dwo-m-5',
+    workOrderCode: 'CJGD20260603007',
+    workOrderName: '深井潜水泵拆解001',
+    taskNo: 'T20260603007',
+    processName: '拆解',
+    processSeq: 1,
+    productName: '深井潜水泵',
+    itemCode: 'CP2610004',
+    specModel: 'QJ200-50/4',
+    barcodeType: '一类一码',
+    processRoute: '装配标准路线',
+    executor: 'admin',
+    groupName: '加工小组',
+    expectedQty: 2,
+    taskStatus: '待开始',
+    ebomKey: 'ebom-sewage-pump',
+    createdAt: '2026-06-03 08:30:00',
+  }),
+  // —— 返工任务（对应 rw-demo-*）——
+  taskSeed({
+    id: 'mobile-rw-demo-1-0',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-rework-mock-1',
+    workOrderCode: 'WO-RW-001',
+    workOrderName: '潜水电泵返工演示',
+    taskNo: 'RW20261021001',
+    processName: '粗车',
+    processSeq: 2,
+    productName: '潜水电泵 QJ200-40/3',
+    itemCode: 'CP2610004',
+    specModel: 'QJ200-40/3',
+    material: 'HT200',
+    drawingNo: 'DWG-QJ200',
+    barcodeType: '一批一码',
+    processRoute: '机加标准路线',
+    executor: '张三',
+    executors: ['张三'],
+    expectedQty: 2,
+    scheduleQty: 2,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    dispatchControl: 'parallel',
+    isRework: true,
+    reworkOrderId: 'rw-demo-1',
+    reworkNo: 'FG20261021001',
+    scheduleBatchId: 'sb-fallback-wo-rework-mock-1',
+    scheduleBatchNo: 1,
+    batchId: 'sb-fallback-wo-rework-mock-1',
+    createdAt: `${formatTaskDate()} 09:10:00`,
+    remark: '返工任务 · FG20261021001',
+  }),
+  taskSeed({
+    id: 'mobile-rw-demo-1-1',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-rework-mock-1',
+    workOrderCode: 'WO-RW-001',
+    workOrderName: '潜水电泵返工演示',
+    taskNo: 'RW20261021002',
+    processName: '精车',
+    processSeq: 3,
+    productName: '潜水电泵 QJ200-40/3',
+    itemCode: 'CP2610004',
+    specModel: 'QJ200-40/3',
+    material: 'HT200',
+    drawingNo: 'DWG-QJ200',
+    barcodeType: '一批一码',
+    processRoute: '机加标准路线',
+    executor: '张三',
+    executors: ['张三'],
+    expectedQty: 2,
+    scheduleQty: 2,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    dispatchControl: 'parallel',
+    isRework: true,
+    reworkOrderId: 'rw-demo-1',
+    reworkNo: 'FG20261021001',
+    scheduleBatchId: 'sb-fallback-wo-rework-mock-1',
+    scheduleBatchNo: 1,
+    batchId: 'sb-fallback-wo-rework-mock-1',
+    createdAt: `${formatTaskDate()} 09:12:00`,
+    remark: '返工任务 · FG20261021001',
+  }),
+  taskSeed({
+    id: 'mobile-rw-demo-2-0',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-lh-demo-1',
+    workOrderCode: 'WO202605270-LH01',
+    workOrderName: '工时演示-批量计件计件生产工单',
+    taskNo: 'RW20261020003',
+    processName: '机加工',
+    processSeq: 1,
+    productName: '工时演示-批量计件计件',
+    itemCode: 'LH-MAT-01',
+    specModel: 'DEMO-BC-P',
+    material: 'HT250',
+    drawingNo: 'LH-01-DWG',
+    barcodeType: '一批一码',
+    processRoute: '机加标准路线',
+    executor: '张三',
+    executors: ['张三'],
+    expectedQty: 3,
+    scheduleQty: 3,
+    reportedGoodQty: 1,
+    taskStatus: '待报工',
+    placement: 'todo',
+    serialLocked: false,
+    dispatchControl: 'parallel',
+    isRework: true,
+    reworkOrderId: 'rw-demo-2',
+    reworkNo: 'FG20261021002',
+    scheduleBatchId: 'sb-fallback-wo-lh-demo-1',
+    scheduleBatchNo: 1,
+    batchId: 'sb-fallback-wo-lh-demo-1',
+    createdAt: `${formatTaskDate()} 08:40:00`,
+    remark: '返工任务 · FG20261021002（已报 1 件）',
+  }),
+  taskSeed({
+    id: 'mobile-rw-demo-3-0',
+    orderCategory: '生产工单',
+    workOrderId: 'wo-pr-1',
+    workOrderCode: 'WO-062',
+    workOrderName: '货架支架生产工单',
+    taskNo: 'RW20261019004',
+    processName: '点焊',
+    processSeq: 1,
+    productName: '货架支架',
+    itemCode: 'SJ-2024-A',
+    specModel: '1200×600mm',
+    material: 'Q235',
+    drawingNo: 'SJ-2024-A-DWG',
+    barcodeType: '一批一码',
+    processRoute: '标准焊接工艺 v2',
+    executor: '张三',
+    executors: ['张三'],
+    expectedQty: 4,
+    scheduleQty: 4,
+    reportedGoodQty: 4,
+    taskStatus: '已完成',
+    placement: 'todo',
+    serialLocked: false,
+    dispatchControl: 'parallel',
+    isRework: true,
+    reworkOrderId: 'rw-demo-3',
+    reworkNo: 'FG20261020003',
+    scheduleBatchId: 'sb-fallback-wo-pr-1',
+    scheduleBatchNo: 1,
+    batchId: 'sb-fallback-wo-pr-1',
+    createdAt: `${formatTaskDate()} 10:15:00`,
+    finishedAt: `${formatTaskDate()} 10:15:00`,
+    remark: '返工任务 · FG20261020003',
+  }),
+]
+
+function taskSeed(partial) {
+  return {
+    orderCategory: '拆解工单',
+    orderSource: '生产报废',
+    workOrderRemark: '',
+    nextProcess: getNextProcess(partial.processName),
+    laborCalcMethod: '时长报工+计时工资',
+    resourceType: partial.resourceType || '工人',
+    placement: partial.placement || 'todo',
+    dispatchControl: partial.dispatchControl || 'serial',
+    serialLocked: partial.serialLocked ?? false,
+    claimTargets: partial.claimTargets || [],
+    groupNames: partial.groupNames || [],
+    claimedGroups: partial.claimedGroups || [],
+    groupLeader: partial.groupLeader || '',
+    leaderParticipates: partial.leaderParticipates ?? true,
+    groupWorkers: partial.groupWorkers || [],
+    executors: partial.executors || [],
+    taskGroupId: partial.taskGroupId || '',
+    taskExecutionMode: partial.taskExecutionMode || 'single_claim',
+    collaborationSlot: partial.collaborationSlot ?? null,
+    collaborationTotal: partial.collaborationTotal ?? 1,
+    baseTaskNo: partial.baseTaskNo || partial.taskNo || '',
+    reportMode: partial.reportMode || '',
+    ...partial,
+  }
+}
+
+function getNextProcess(current) {
+  const idx = DISASSEMBLY_PROCESSES.indexOf(current)
+  if (idx < 0 || idx >= DISASSEMBLY_PROCESSES.length - 1) return ''
+  return DISASSEMBLY_PROCESSES[idx + 1]
+}
+
+const TASK_SEED_VERSION_KEY = 'i_doms_mobile_tasks_seed_v'
+const TASK_SEED_VERSION = '12'
+
+function buildSeedTasks() {
+  const today = formatTaskDate()
+  const fresh = JSON.parse(JSON.stringify(seedTasks))
+  fresh.forEach((t) => {
+    if (
+      typeof t.id === 'string' &&
+      (t.id.startsWith('pt-') || t.id.startsWith('pt-claim-') || t.id.startsWith('mobile-rw-demo-')) &&
+      t.createdAt
+    ) {
+      const timePart = t.createdAt.split(' ').slice(1).join(' ') || '08:00:00'
+      t.createdAt = `${today} ${timePart}`
+    }
+  })
+  return fresh
+}
+
+function load() {
+  if (uni.getStorageSync(TASK_SEED_VERSION_KEY) !== TASK_SEED_VERSION) {
+    const fresh = buildSeedTasks()
+    uni.setStorageSync(STORAGE_KEY, JSON.stringify(fresh))
+    uni.setStorageSync(TASK_SEED_VERSION_KEY, TASK_SEED_VERSION)
+    return fresh
+  }
+  try {
+    const raw = uni.getStorageSync(STORAGE_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch {
+    /* ignore */
+  }
+  return JSON.parse(JSON.stringify(seedTasks))
+}
+
+let cache = load()
+
+function save() {
+  uni.setStorageSync(STORAGE_KEY, JSON.stringify(cache))
+}
+
+function removeStorageQuiet(key) {
+  try {
+    uni.removeStorageSync(key)
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(key)
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 清除本机任务缓存与同步队列，恢复仓库种子 */
+export function resetDisassemblyTaskDemoData() {
+  removeStorageQuiet(STORAGE_KEY)
+  removeStorageQuiet(TASK_SEED_VERSION_KEY)
+  removeStorageQuiet(MOBILE_TASK_SYNC_KEY)
+  removeStorageQuiet(SYNC_KEY)
+  cache = buildSeedTasks()
+  uni.setStorageSync(STORAGE_KEY, JSON.stringify(cache))
+  uni.setStorageSync(TASK_SEED_VERSION_KEY, TASK_SEED_VERSION)
+  return cache
+}
+
+function loadDrafts() {
+  try {
+    const raw = uni.getStorageSync(DRAFT_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch {
+    /* ignore */
+  }
+  return {}
+}
+
+function saveDrafts(drafts) {
+  uni.setStorageSync(DRAFT_KEY, JSON.stringify(drafts))
+}
+
+function loadResults() {
+  try {
+    const raw = uni.getStorageSync(RESULT_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch {
+    /* ignore */
+  }
+  return {}
+}
+
+function saveResults(results) {
+  uni.setStorageSync(RESULT_KEY, JSON.stringify(results))
+}
+
+function loadJson(key, fallback = []) {
+  try {
+    const raw = uni.getStorageSync(key)
+    if (raw) return JSON.parse(raw)
+  } catch {
+    /* ignore */
+  }
+  return fallback
+}
+
+function saveJson(key, data) {
+  uni.setStorageSync(key, JSON.stringify(data))
+}
+
+export function getDisassemblyResult(workOrderId) {
+  const results = loadResults()
+  if (results[workOrderId]) return results[workOrderId]
+  return buildSeedDisassemblyResult(workOrderId)
+}
+
+function buildSeedDisassemblyResult(workOrderId) {
+  if (workOrderId !== 'dwo-m-3') return null
+  const raw = getEbomByKey('ebom-sewage-pump')
+  const nodes = initEbomExecutionState(raw)
+  const pumpBody = nodes[0]
+  pumpBody.expanded = true
+  pumpBody.disposeMode = 'partial'
+  pumpBody.children[0].expanded = true
+  const casting = pumpBody.children[0].children[0]
+  casting.reuseQty = 1
+  casting.scrapQty = 0
+  casting.disposeMode = 'all_reuse'
+  const flange = pumpBody.children[0].children[1]
+  flange.reuseQty = 1
+  flange.scrapQty = 1
+  flange.disposeMode = 'partial'
+  flange.scrapReason = '加工损坏'
+  flange.processResult = '直接弃用'
+  const pumpHead = nodes[1]
+  pumpHead.expanded = false
+  pumpHead.disposeMode = 'all_reuse'
+  return {
+    workOrderId,
+    ebomNodes: nodes,
+    stats: calcDisassemblyStats(nodes),
+    disassemblyExecutor: '孙琴丽',
+    completedAt: '2026-06-02 16:30:00',
+  }
+}
+
+export function saveDisassemblyResult(workOrderId, payload) {
+  const results = loadResults()
+  results[workOrderId] = payload
+  saveResults(results)
+  syncToPcMaterials(workOrderId, payload)
+}
+
+function syncToPcMaterials(workOrderId, payload) {
+  const sync = loadJson(SYNC_KEY, {})
+  const materials = flattenLeafNodes(payload.ebomNodes || []).map((n, i) => ({
+    id: `dm-sync-${workOrderId}-${i}`,
+    materialName: n.materialName,
+    materialCode: n.materialCode,
+    specModel: '—',
+    qty: n.unitQty,
+    reuseQty: n.reuseQty,
+    scrapQty: n.scrapQty,
+    scrapReason: n.scrapReason,
+    processResult: n.processResult || '',
+    unit: n.unit || '件',
+    disposeMode: n.disposeMode,
+  }))
+  sync[workOrderId] = {
+    materials,
+    stats: payload.stats,
+    syncedAt: new Date().toISOString(),
+  }
+  saveJson(SYNC_KEY, sync)
+}
+
+export function getTasksByWorkOrder(workOrderId) {
+  return cache.filter((t) => t.workOrderId === workOrderId)
+}
+
+export function getWorkOrderProgress(workOrderId) {
+  const statusMap = loadJson(WO_STATUS_KEY, {})
+  return statusMap[workOrderId] || '执行中'
+}
+
+function setWorkOrderProgress(workOrderId, progress) {
+  const statusMap = loadJson(WO_STATUS_KEY, {})
+  statusMap[workOrderId] = progress
+  saveJson(WO_STATUS_KEY, statusMap)
+}
+
+/** 质检执行页数据 */
+export function getQcExecutionState(taskId) {
+  const task = getTaskById(taskId)
+  if (!task || task.processName !== '拆解质检') return null
+  const result = getDisassemblyResult(task.workOrderId)
+  if (!result) {
+    return { task, result: null, ebomNodes: [], stats: { dismantled: 0, reuse: 0, scrap: 0 } }
+  }
+  const ebomNodes = initQcDisplayState(result.ebomNodes)
+  return {
+    task,
+    result,
+    ebomNodes,
+    stats: calcDisassemblyStats(ebomNodes),
+    disassemblyExecutor: result.disassemblyExecutor || '—',
+  }
+}
+
+function validateWarehouseBeforePass(ebomNodes, reuseWarehouse, scrapWarehouse) {
+  const leaves = flattenLeafNodes(ebomNodes)
+  const hasReuse = leaves.some((n) => n.reuseQty > 0)
+  const needScrapWarehouse = leaves.some(
+    (n) => n.scrapQty > 0 && n.processResult === '财务变现',
+  )
+  if (hasReuse && !reuseWarehouse) {
+    return { ok: false, message: '请先填写目标仓库，再执行操作。' }
+  }
+  if (needScrapWarehouse && !scrapWarehouse) {
+    return { ok: false, message: '请先填写目标仓库，再执行操作。' }
+  }
+  return { ok: true }
+}
+
+export function validateQcWarehouse(ebomNodes, reuseWarehouse, scrapWarehouse) {
+  return validateWarehouseBeforePass(ebomNodes, reuseWarehouse, scrapWarehouse)
+}
+
+export function passQcInspection(taskId, payload) {
+  const task = getTaskById(taskId)
+  if (!task) return { ok: false, message: '任务不存在' }
+  if (task.processName !== '拆解质检') {
+    return { ok: false, message: '仅拆解质检任务可通过' }
+  }
+
+  const ebomNodes = payload.ebomNodes || []
+  const check = validateWarehouseBeforePass(
+    ebomNodes,
+    payload.reuseWarehouse,
+    payload.scrapWarehouse,
+  )
+  if (!check.ok) return check
+
+  const stats = calcDisassemblyStats(ebomNodes)
+  task.taskStatus = '已完成'
+  task.finishedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+  task.qcResult = {
+    passed: true,
+    reuseWarehouse: payload.reuseWarehouse,
+    scrapWarehouse: payload.scrapWarehouse,
+    stats,
+  }
+  save()
+
+  setWorkOrderProgress(task.workOrderId, '已完成')
+  saveDisassemblyResult(task.workOrderId, {
+    ...getDisassemblyResult(task.workOrderId),
+    ebomNodes,
+    stats,
+    qcPassedAt: task.finishedAt,
+  })
+
+  createInboundRecords(task, ebomNodes, payload.reuseWarehouse)
+  createScrapRecords(task, ebomNodes)
+
+  unlockNextSerialTask(task.workOrderId, task.processSeq)
+  save()
+
+  return { ok: true, message: '质检通过' }
+}
+
+function createInboundRecords(task, ebomNodes, warehouse) {
+  const list = loadJson(INBOUND_KEY, [])
+  const leaves = flattenLeafNodes(ebomNodes).filter((n) => n.reuseQty > 0)
+  leaves.forEach((n, i) => {
+    list.unshift({
+      id: `in-${task.workOrderId}-${Date.now()}-${i}`,
+      workOrderCode: task.workOrderCode,
+      materialName: n.materialName,
+      materialCode: n.materialCode,
+      qty: n.reuseQty,
+      warehouse: warehouse || '半成品仓',
+      status: '待处理',
+      type: '拆解回用',
+      createdAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    })
+  })
+  saveJson(INBOUND_KEY, list)
+}
+
+function createScrapRecords(task, ebomNodes) {
+  const list = loadJson(SCRAP_MGMT_KEY, [])
+  const leaves = flattenLeafNodes(ebomNodes).filter((n) => n.scrapQty > 0)
+  leaves.forEach((n, i) => {
+    list.unshift({
+      id: `sc-${task.workOrderId}-${Date.now()}-${i}`,
+      workOrderCode: task.workOrderCode,
+      materialName: n.materialName,
+      materialCode: n.materialCode,
+      scrapQty: n.scrapQty,
+      scrapReason: n.scrapReason,
+      processResult: n.processResult || '直接弃用',
+      createdAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    })
+  })
+  saveJson(SCRAP_MGMT_KEY, list)
+}
+
+export function rejectQcInspection(taskId) {
+  const task = getTaskById(taskId)
+  if (!task) return { ok: false, message: '任务不存在' }
+
+  task.taskStatus = '已完成'
+  task.finishedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+  task.qcResult = { passed: false, rejected: true }
+  save()
+
+  const disassemblyTask = cache.find(
+    (t) => t.workOrderId === task.workOrderId && t.processName === '拆解',
+  )
+  const executor = disassemblyTask?.executor || 'admin'
+  const reworkTask = taskSeed({
+    id: `dt-rework-${Date.now()}`,
+    workOrderId: task.workOrderId,
+    workOrderCode: task.workOrderCode,
+    workOrderName: `${task.productName}拆解返工`,
+    taskNo: `T${Date.now()}`,
+    processName: '拆解',
+    processSeq: 1,
+    productName: task.productName,
+    itemCode: task.itemCode,
+    specModel: task.specModel,
+    barcodeType: task.barcodeType,
+    serialNo: task.serialNo,
+    processRoute: task.processRoute,
+    executor,
+    groupName: disassemblyTask?.groupName || '加工小组',
+    expectedQty: task.expectedQty,
+    taskStatus: '待开始',
+    ebomKey: task.ebomKey,
+    createdAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    isRework: true,
+  })
+  cache.unshift(reworkTask)
+  save()
+
+  return { ok: true, message: '已驳回，已生成拆解返工任务' }
+}
+
+function readPcSyncQueue() {
+  const queues = []
+  try {
+    const rawUni = uni.getStorageSync(MOBILE_TASK_SYNC_KEY)
+    if (rawUni) queues.push(typeof rawUni === 'string' ? JSON.parse(rawUni) : rawUni)
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const rawWeb = localStorage.getItem(MOBILE_TASK_SYNC_KEY)
+      if (rawWeb) queues.push(JSON.parse(rawWeb))
+    }
+  } catch {
+    /* ignore */
+  }
+  return queues.flat()
+}
+
+export function mergePcSyncedTasks() {
+  const synced = readPcSyncQueue()
+  if (!synced.length) return 0
+  let merged = 0
+  const newTasks = []
+  for (const task of synced) {
+    if (!task?.id) continue
+    const idx = cache.findIndex((t) => t.id === task.id)
+    const normalized = taskSeed(task)
+    if (idx >= 0) {
+      cache[idx] = { ...cache[idx], ...normalized }
+    } else {
+      cache.unshift(normalized)
+      newTasks.push(normalized)
+      merged += 1
+    }
+  }
+  if (merged) {
+    save()
+    generateLinesFromSyncedTasks(newTasks)
+  }
+  return merged
+}
+
+/** 小程序新建返工单后写入待报工任务 */
+export function appendReworkMobileTasks(tasks = []) {
+  if (!Array.isArray(tasks) || !tasks.length) return 0
+  mergePcSyncedTasks()
+  let added = 0
+  for (const task of tasks) {
+    if (!task?.id) continue
+    const normalized = taskSeed({
+      orderCategory: task.orderCategory || '生产工单',
+      placement: 'todo',
+      ...task,
+    })
+    const idx = cache.findIndex((t) => t.id === task.id)
+    if (idx >= 0) {
+      cache[idx] = { ...cache[idx], ...normalized }
+    } else {
+      cache.unshift(normalized)
+      added += 1
+    }
+  }
+  save()
+  try {
+    const raw = uni.getStorageSync(MOBILE_TASK_SYNC_KEY)
+    const queue = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : []
+    const map = new Map((Array.isArray(queue) ? queue : []).map((t) => [t.id, t]))
+    tasks.forEach((t) => {
+      if (t?.id) map.set(t.id, t)
+    })
+    uni.setStorageSync(MOBILE_TASK_SYNC_KEY, JSON.stringify([...map.values()]))
+  } catch {
+    /* ignore */
+  }
+  return added
+}
+
+function visibleTasks() {
+  return cache.filter((t) => !t.serialLocked)
+}
+
+export function getTaskList(tab = 'todo') {
+  mergePcSyncedTasks()
+  const list = visibleTasks()
+  if (tab === 'history') {
+    return list.filter((t) => t.taskStatus === '已完成')
+  }
+  if (tab === 'claim') {
+    return list.filter((t) => t.placement === 'claim' && t.taskStatus !== '已完成')
+  }
+  return list.filter((t) => t.taskStatus !== '已完成' && t.placement !== 'claim')
+}
+
+export function claimTask(taskId, userName = 'admin') {
+  const task = getTaskById(taskId)
+  if (!task) return { ok: false, message: '任务不存在' }
+  if (task.hiddenByTerminate) return { ok: false, message: '工单已终止，任务不可领取' }
+  if (task.controlStatus === '暂停') return { ok: false, message: '工单已暂停，任务不可领取' }
+  if (task.serialLocked) return { ok: false, message: '上道工序未报工完成，暂不可领取' }
+  if (task.placement !== 'claim') return { ok: false, message: '该任务不在待领列表' }
+  if (task.resourceType === '工人小组' && isMultiGroupTask(task)) {
+    const myGroup = getTaskAssignGroups(task).find((groupName) => getGroupLeaderName(groupName) === userName)
+    if (!myGroup) return { ok: false, message: '仅小组组长可领取该任务' }
+    if ((task.claimedGroups || []).includes(myGroup)) {
+      return { ok: false, message: '该小组已领取此任务' }
+    }
+    task.claimedGroups = [...(task.claimedGroups || []), myGroup]
+    task.claimedBy = task.claimedBy || userName
+    task.groupLeader = userName
+    task.claimedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+    task.taskStatus = '待报工'
+    save()
+    return { ok: true, task }
+  }
+  if (task.claimedBy) return { ok: false, message: '任务已被领取' }
+  if (task.resourceType === '工人小组') {
+    return { ok: false, message: '单小组任务无需领取，请直接报工' }
+  }
+  const targets = task.claimTargets?.length ? task.claimTargets : task.executors
+  if (targets?.length && !targets.includes(userName)) {
+    return { ok: false, message: '您不在该任务的领取范围内' }
+  }
+  task.placement = 'todo'
+  task.claimedBy = userName
+  task.claimedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+  task.executor = userName
+  task.taskStatus = '待报工'
+  save()
+  return { ok: true, task }
+}
+
+export function getDistributableWorkers(task) {
+  const workers = task.groupWorkers || []
+  if (task.leaderParticipates) return workers
+  return workers.filter((w) => !w.isLeader)
+}
+
+export function distributeTask(taskId, executorName) {
+  const task = getTaskById(taskId)
+  if (!task) return { ok: false, message: '任务不存在' }
+  if (task.taskStatus !== '待分发') return { ok: false, message: '当前任务不可分发' }
+  const allowed = getDistributableWorkers(task).map((w) => w.name)
+  if (!allowed.includes(executorName)) {
+    return { ok: false, message: '所选执行人不在可分发范围内' }
+  }
+  task.executor = executorName
+  task.taskStatus = '待开始'
+  task.distributedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+  save()
+  return { ok: true, task }
+}
+
+function isProcessGroupCompleted(workOrderId, processSeq) {
+  const groupTasks = cache.filter(
+    (t) => t.workOrderId === workOrderId && t.processSeq === processSeq,
+  )
+  if (!groupTasks.length) return false
+  return groupTasks.every((t) => t.taskStatus === '已完成')
+}
+
+export function unlockNextSerialTask(workOrderId, completedProcessSeq) {
+  const sample = cache.find((t) => t.workOrderId === workOrderId)
+  if (sample?.dispatchControl === 'parallel') return null
+  if (!sample?.dispatchControl && isParallelTaskDispatch()) return null
+  if (!isProcessGroupCompleted(workOrderId, completedProcessSeq)) return null
+  const nextTasks = cache.filter(
+    (t) =>
+      t.workOrderId === workOrderId &&
+      t.processSeq === completedProcessSeq + 1 &&
+      t.serialLocked,
+  )
+  if (!nextTasks.length) return null
+  nextTasks.forEach((next) => {
+    next.serialLocked = false
+  })
+  save()
+  return nextTasks[0]
+}
+
+export function getTasksByProcessGroup(workOrderId, processSeq) {
+  mergePcSyncedTasks()
+  return cache.filter((t) => t.workOrderId === workOrderId && t.processSeq === processSeq)
+}
+
+export function isProcessGroupCompletedForWorkOrder(workOrderId, processSeq) {
+  mergePcSyncedTasks()
+  return isProcessGroupCompleted(workOrderId, processSeq)
+}
+
+export function getTaskById(id) {
+  mergePcSyncedTasks()
+  return cache.find((t) => t.id === id) || null
+}
+
+export function getAllTasks() {
+  mergePcSyncedTasks()
+  return [...cache]
+}
+
+export function updateTaskById(id, patch) {
+  const task = cache.find((t) => t.id === id)
+  if (!task) return null
+  Object.assign(task, patch)
+  save()
+  return task
+}
+
+export function getPendingTaskCount() {
+  mergePcSyncedTasks()
+  return visibleTasks().filter(
+    (t) => t.taskStatus !== '已完成' && ['todo', 'claim'].includes(t.placement || 'todo'),
+  ).length
+}
+
+export function getClaimTaskCount() {
+  mergePcSyncedTasks()
+  return getTaskList('claim').length
+}
+
+/** 获取或初始化执行态 EBOM */
+export function getTaskExecutionState(taskId) {
+  const task = getTaskById(taskId)
+  if (!task) return null
+  const drafts = loadDrafts()
+  if (drafts[taskId]?.ebomNodes) {
+    return {
+      task,
+      ebomNodes: drafts[taskId].ebomNodes,
+      reuseWarehouse: drafts[taskId].reuseWarehouse || '',
+      scrapWarehouse: drafts[taskId].scrapWarehouse || '',
+    }
+  }
+  const raw = getEbomByKey(task.ebomKey)
+  const ebomNodes = initEbomExecutionState(raw)
+  return { task, ebomNodes, reuseWarehouse: '', scrapWarehouse: '' }
+}
+
+export function validateDisassemblyWarehouse(ebomNodes, reuseWarehouse, scrapWarehouse) {
+  const stats = calcDisassemblyStats(ebomNodes)
+  if (stats.reuse > 0 && !reuseWarehouse) {
+    return { ok: false, message: '有回用物品时请填写回用仓库' }
+  }
+  if (stats.scrap > 0 && !scrapWarehouse) {
+    return { ok: false, message: '有报废物品时请填写报废仓库' }
+  }
+  return { ok: true }
+}
+
+export function saveTaskDraft(taskId, payload) {
+  const ebomNodes = Array.isArray(payload) ? payload : payload.ebomNodes
+  const drafts = loadDrafts()
+  drafts[taskId] = {
+    ebomNodes,
+    reuseWarehouse: payload.reuseWarehouse || '',
+    scrapWarehouse: payload.scrapWarehouse || '',
+    savedAt: new Date().toISOString(),
+  }
+  saveDrafts(drafts)
+  const task = getTaskById(taskId)
+  if (task && task.taskStatus === '待开始') {
+    task.taskStatus = '执行中'
+    task.startedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+    save()
+  }
+  return { ok: true, message: '已暂存' }
+}
+
+export function startTask(taskId) {
+  const task = getTaskById(taskId)
+  if (!task) return { ok: false, message: '任务不存在' }
+  if (task.taskStatus === '待分发') {
+    return { ok: false, message: '请先完成分发' }
+  }
+  if (task.taskStatus === '已完成') {
+    return { ok: false, message: '任务已完成' }
+  }
+  if (task.taskStatus === '待开始') {
+    task.taskStatus = '执行中'
+    task.startedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+    save()
+  }
+  return { ok: true, task }
+}
+
+export function completeDisassemblyTask(taskId, payload) {
+  const task = getTaskById(taskId)
+  if (!task) return { ok: false, message: '任务不存在' }
+  if (task.processName !== '拆解') {
+    return { ok: false, message: '当前仅支持拆解工序完工' }
+  }
+
+  const ebomNodes = payload.ebomNodes || []
+  for (const n of flattenNodes(ebomNodes)) {
+    if (n.reuseQty + n.scrapQty !== n.unitQty) {
+      return { ok: false, message: `「${n.materialName}」回用与报废数量之和须等于可拆数量` }
+    }
+  }
+
+  if (!payload.workDuration && payload.workDuration !== 0) {
+    return { ok: false, message: '请填写本次报工时长' }
+  }
+
+  const whCheck = validateDisassemblyWarehouse(
+    ebomNodes,
+    payload.reuseWarehouse,
+    payload.scrapWarehouse,
+  )
+  if (!whCheck.ok) return whCheck
+
+  const stats = calcDisassemblyStats(ebomNodes)
+  task.taskStatus = '已完成'
+  task.finishedAt = payload.endTime || new Date().toISOString().slice(0, 19).replace('T', ' ')
+  task.completion = {
+    reuseQty: stats.reuse,
+    scrapQty: stats.scrap,
+    reuseWarehouse: payload.reuseWarehouse || '',
+    scrapWarehouse: payload.scrapWarehouse || '',
+    workDuration: payload.workDuration,
+    startTime: payload.startTime,
+    endTime: payload.endTime,
+    remark: payload.remark || '',
+  }
+  save()
+
+  const disassemblyTask = cache.find(
+    (t) => t.workOrderId === task.workOrderId && t.processName === '拆解',
+  )
+  saveDisassemblyResult(task.workOrderId, {
+    workOrderId: task.workOrderId,
+    ebomNodes,
+    stats,
+    reuseWarehouse: payload.reuseWarehouse || '',
+    scrapWarehouse: payload.scrapWarehouse || '',
+    disassemblyExecutor: task.executor,
+    completedAt: task.finishedAt,
+  })
+
+  unlockNextSerialTask(task.workOrderId, task.processSeq)
+  save()
+
+  const drafts = loadDrafts()
+  delete drafts[taskId]
+  saveDrafts(drafts)
+
+  return {
+    ok: true,
+    message: '拆解完工',
+    stats,
+    nextProcess: task.nextProcess,
+  }
+}
+
+function flattenNodes(nodes, out = []) {
+  return flattenLeafNodes(nodes, out)
+}
+
+export { DISASSEMBLY_PROCESSES }

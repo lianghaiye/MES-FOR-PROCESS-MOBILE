@@ -1,0 +1,1304 @@
+<template>
+  <view class="execute-page">
+    <view class="custom-nav">
+      <view class="nav-back" @tap="onNavBack">
+        <text class="back-arrow">‹</text>
+      </view>
+      <text class="nav-title">{{ editId ? '重新报工' : '填写报工' }}</text>
+      <view class="nav-placeholder" />
+    </view>
+
+    <view class="sub-title-row">
+      <view class="sub-title">
+        {{ processName }} · {{ productName }} {{ productCode }}
+        <text v-if="collaborationLabel" class="collab-tag">{{ collaborationLabel }}</text>
+      </view>
+      <text
+        v-if="!editId && !isQuickSource"
+        class="order-delete"
+        @tap="onRemoveOrder"
+      >删除</text>
+    </view>
+
+    <view v-if="selectedWorkerNames.length" class="workers-banner">
+      <text class="workers-label">已选工人</text>
+      <view class="workers-chips">
+        <view
+          v-for="name in selectedWorkerNames"
+          :key="name"
+          class="worker-chip"
+          @tap="removeSelectedWorker(name)"
+        >
+          <text>{{ name }}</text>
+          <text class="worker-chip-x">×</text>
+        </view>
+      </view>
+      <text class="workers-hint">请核对代报对象；工人至少保留一人</text>
+    </view>
+
+    <view v-if="collaborationPeers.length" class="collab-card">
+      <text class="collab-title">协作进度</text>
+      <view v-for="peer in collaborationPeers" :key="peer.id" class="collab-row">
+        <text class="collab-name">{{ peer.executor || '—' }}</text>
+        <text class="collab-status" :class="{ done: peer.taskStatus === '已完成' }">
+          {{ peer.taskStatus === '已完成' ? '已完成' : '进行中' }}
+        </text>
+      </view>
+    </view>
+
+    <view v-if="showProductMeta" class="product-meta">
+      <text v-if="specModel" class="meta-item">规格: {{ specModel }}</text>
+      <text class="meta-item">材质: {{ material || '—' }}</text>
+      <text class="meta-item">图号: {{ drawingNo || '—' }}</text>
+    </view>
+
+    <view class="mode-tags">
+      <view class="mode-tag">{{ displayReportMode(reportMode) }}</view>
+      <view v-if="workItemEntryMode !== 'none'" class="mode-tag work-item-tag">作业分项</view>
+      <view class="source-tag">{{ displayReportSource(context.source) }}</view>
+    </view>
+
+    <view class="card">
+      <text class="card-title">报工信息{{ isDurationReportMode(reportMode) ? '（时长型）' : '' }}</text>
+
+      <view v-if="targetQty" class="target-bar">
+        <view class="target-item">
+          <text>排产数量</text>
+          <text class="target-num">{{ targetQty }} 件</text>
+        </view>
+        <view v-if="remainingQty != null && isScheduleMode" class="target-item highlight">
+          <text>待报工</text>
+          <text class="target-num">{{ remainingQty }} 件</text>
+        </view>
+      </view>
+
+      <view v-if="workItemEntryMode === 'qty'" class="work-items-block">
+        <text class="work-items-title">作业分项{{ isScheduleMode ? '（需同时填写数量）' : '' }}</text>
+        <view v-for="(item, idx) in form.workItems" :key="item.itemCode" class="work-item-row">
+          <view class="work-item-meta">
+            <text class="work-item-name">{{ item.itemName }}</text>
+            <text class="work-item-hint">
+              {{ item.unit || '个' }}
+              <text v-if="item.plannedQtyTotal != null"> · 计划 {{ item.plannedQtyTotal }}</text>
+            </text>
+          </view>
+          <view class="stepper">
+            <view class="step-btn" @tap="changeWorkItemQty(idx, -1)">−</view>
+            <input v-model.number="item.qty" class="step-val" type="digit" />
+            <view class="step-btn primary" @tap="changeWorkItemQty(idx, 1)">+</view>
+          </view>
+        </view>
+      </view>
+
+      <view v-else-if="workItemEntryMode === 'select'" class="work-items-block">
+        <text class="work-items-title">
+          {{
+            isItemizedReport
+              ? '作业分项（勾选，不填数量）'
+              : '作业分项（可选，勾选即可）'
+          }}
+        </text>
+        <view
+          v-for="(item, idx) in form.workItems"
+          :key="item.itemCode"
+          class="work-item-select-row"
+          @tap="toggleWorkItemSelected(idx)"
+        >
+          <view class="work-item-check" :class="{ on: item.selected }">
+            <text v-if="item.selected">✓</text>
+          </view>
+          <view class="work-item-meta">
+            <text class="work-item-name">{{ item.itemName }}</text>
+            <text class="work-item-hint">{{ item.unit || '个' }} · 不填数量</text>
+          </view>
+        </view>
+      </view>
+
+      <!-- 批量计件 -->
+      <template v-if="!isDurationReportMode(reportMode) && showPieceQtyFields">
+        <view class="field">
+          <text
+            class="label"
+            :class="{ required: isScheduleMode || isItemizedReport }"
+          >良品数量</text>
+          <view class="stepper">
+            <view class="step-btn" @tap="changeQty('good', -1)">−</view>
+            <input v-model.number="form.goodQty" class="step-val" type="digit" />
+            <view class="step-btn primary" @tap="changeQty('good', 1)">+</view>
+          </view>
+        </view>
+        <view class="field">
+          <text class="label">不良品数量</text>
+          <view class="stepper">
+            <view class="step-btn" @tap="changeQty('defect', -1)">−</view>
+            <input v-model.number="form.defectQty" class="step-val" type="digit" @focus="onDefectQtyFocus" @blur="onDefectQtyBlur" />
+            <view class="step-btn primary" @tap="changeQty('defect', 1)">+</view>
+          </view>
+        </view>
+        <DefectBreakdownField
+          :defect-qty="Number(form.defectQty) || 0"
+          :items="defectItems"
+          :model-value="form.defectBreakdown"
+          @update:model-value="onDefectBreakdownUpdate"
+        />
+      </template>
+
+      <!-- 时长报工 -->
+      <template v-else>
+        <view class="field">
+          <text class="label required">工作时长（小时）</text>
+          <view class="stepper">
+            <view class="step-btn" @tap="changeHours(-0.5)">−</view>
+            <input v-model="form.workHours" class="step-val" type="digit" />
+            <view class="step-btn primary" @tap="changeHours(0.5)">+</view>
+          </view>
+        </view>
+        <view class="field">
+          <text class="label required">良品数量</text>
+          <view class="stepper">
+            <view class="step-btn" @tap="changeQty('good', -1)">−</view>
+            <input v-model.number="form.goodQty" class="step-val" type="digit" />
+            <view class="step-btn primary" @tap="changeQty('good', 1)">+</view>
+          </view>
+        </view>
+        <view class="field">
+          <text class="label">不良品数量</text>
+          <view class="stepper">
+            <view class="step-btn" @tap="changeQty('defect', -1)">−</view>
+            <input v-model.number="form.defectQty" class="step-val" type="digit" @focus="onDefectQtyFocus" @blur="onDefectQtyBlur" />
+            <view class="step-btn primary" @tap="changeQty('defect', 1)">+</view>
+          </view>
+        </view>
+        <DefectBreakdownField
+          :defect-qty="Number(form.defectQty) || 0"
+          :items="defectItems"
+          :model-value="form.defectBreakdown"
+          @update:model-value="onDefectBreakdownUpdate"
+        />
+        <view class="time-row">
+          <view class="time-col">
+            <text class="label">开始时间</text>
+            <picker mode="time" :value="form.startTime" @change="onStartChange">
+              <view class="time-box">{{ form.startTime }}</view>
+            </picker>
+          </view>
+          <view class="time-col">
+            <text class="label">结束时间</text>
+            <picker mode="time" :value="form.endTime" @change="onEndChange">
+              <view class="time-box">{{ form.endTime }}</view>
+            </picker>
+          </view>
+        </view>
+      </template>
+
+      <view v-if="!isQuickSource && isProxyMode" class="field readonly-field">
+        <text class="label">执行人</text>
+        <text class="readonly-val">{{ form.reporter }}</text>
+      </view>
+
+      <view v-if="!isQuickSource && isProxyMode" class="field readonly-field">
+        <text class="label">操作人</text>
+        <text class="readonly-val">{{ form.operator }}</text>
+      </view>
+
+      <view v-if="!isQuickSource && !isProxyMode" class="field operator-field" @tap="goSelectOperator">
+        <text class="label required">执行人</text>
+        <view class="operator-picker">
+          <text :class="{ placeholder: !form.reporter }">{{ form.reporter || '请选择执行人' }}</text>
+          <text class="arrow">›</text>
+        </view>
+        <text v-if="context.groupName" class="field-hint">可选范围：{{ context.groupName }}成员</text>
+      </view>
+
+      <view class="field">
+        <ImageUpload v-model="form.images" label="现场图片（选填）" hint="可上传报工现场照片" />
+      </view>
+
+      <view class="field">
+        <text class="label">备注（选填）</text>
+        <textarea v-model="form.remark" class="remark" placeholder="添加备注..." />
+      </view>
+    </view>
+
+    <view class="foot">
+      <button class="btn cancel" @tap="onPrevStep">
+        {{ isQuickSource ? '上一步' : '取消' }}
+      </button>
+      <button class="btn submit" :loading="submitting" @tap="onSubmit">
+        {{ editId ? '重新提交' : '提交报工' }}
+      </button>
+    </view>
+  </view>
+</template>
+
+<script setup>
+import { ref, reactive, computed } from 'vue'
+import { onLoad, onBackPress, onShow } from '@dcloudio/uni-app'
+import {
+  getProcessDefectItems,
+  getProcessReportMode,
+} from '@/utils/iodomsStorage'
+import { isDurationReportMode, resolveReportMode, displayReportSource, isQuickReportSource } from '@/utils/reportMode'
+import {
+  breakdownToLegacy,
+  ensureDefectBreakdown,
+  syncDefectBreakdownOnQtyChange,
+  validateDefectBreakdown,
+} from '@/utils/defectBreakdown'
+import DefectBreakdownField from '@/components/quick-report/DefectBreakdownField.vue'
+import ImageUpload from '@/components/ImageUpload.vue'
+import {
+  applyLinkedSingleQtyChange,
+  applyLinkedSingleQtyFromDefect,
+} from '@/utils/processReportQuantities'
+
+function displayReportMode(mode) {
+  return resolveReportMode(mode)
+}
+import { getQuickProductByCode } from '@/mock/processReportProducts'
+import { getRecordById, resubmitProcessReport, submitProcessReport } from '@/mock/processReportRecords'
+import { resolveProductMeta, resolveSalesOrderNo } from '@/mock/processReportProductMeta'
+import { markTaskReported, getCollaborationPeers } from '@/mock/processReportTasks'
+import { getTaskById } from '@/mock/disassemblyTasks'
+import { getUser } from '@/utils/auth'
+import { getGroupWorkerNames, resolveWorkerDisplayName, getUserWorkerGroupNames, isGroupLeader } from '@/utils/workerGroup'
+import { consumeSelectionResult } from '@/utils/selection'
+import {
+  buildWorkItemFormRows,
+  isItemizedReportMode,
+  isScheduleReportMode,
+  normalizeReportQtyMode,
+  normalizeReportWorkItems,
+  normalizeWageQtyMode,
+  resolveWorkItemEntryMode,
+  validateReportWorkItems,
+} from '@/utils/processWorkItem'
+
+const submitting = ref(false)
+const editId = ref('')
+const processName = ref('')
+const productName = ref('')
+const productCode = ref('')
+const specModel = ref('')
+const material = ref('')
+const drawingNo = ref('')
+const reportMode = ref('批量计件')
+const targetQty = ref(null)
+const remainingQty = ref(null)
+const collaborationLabel = ref('')
+const collaborationPeers = ref([])
+const defectItems = ref([])
+const reportForMembers = ref([])
+const context = reactive({
+  source: 'quick',
+  productId: '',
+  taskId: '',
+  taskNo: '',
+  workOrderNo: '',
+  workOrderId: '',
+  processId: '',
+  groupName: '',
+  reportFor: '',
+  isGroupTask: false,
+  salesOrderNo: '',
+})
+
+const form = reactive({
+  goodQty: 0,
+  defectQty: 0,
+  finishedQty: 0,
+  workHours: 4.5,
+  startTime: '',
+  endTime: '',
+  defectBreakdown: [],
+  defectItemIds: [],
+  defectItemNames: [],
+  remark: '',
+  operator: '',
+  reporter: '',
+  images: [],
+  workItems: [],
+})
+
+const reportQtyMode = ref('schedule')
+const wageQtyMode = ref('reported')
+
+const workItemEntryMode = computed(() =>
+  resolveWorkItemEntryMode(
+    reportQtyMode.value,
+    wageQtyMode.value,
+    (form.workItems || []).length > 0,
+  ),
+)
+const isScheduleMode = computed(() => isScheduleReportMode(reportQtyMode.value))
+const isItemizedReport = computed(() => isItemizedReportMode(reportQtyMode.value))
+/** 排产口径，或「分项+报工」：都要填总报工数；仅「分项计薪」以分项数量为主可不填件数 */
+const showPieceQtyFields = computed(
+  () => isScheduleMode.value || workItemEntryMode.value !== 'qty',
+)
+
+const isQuickSource = computed(() => isQuickReportSource(context.source))
+
+const selectedWorkerNames = computed(() => {
+  if (reportForMembers.value.length) return reportForMembers.value
+  return []
+})
+
+const showProductMeta = computed(
+  () =>
+    !isQuickSource.value &&
+    (specModel.value || material.value || drawingNo.value),
+)
+
+const isProxyMode = computed(() => {
+  if (context.source !== 'workorder' || !context.isGroupTask) return false
+  const leaderName = resolveWorkerDisplayName(getUser())
+  return !!context.reportFor && context.reportFor !== leaderName && isGroupLeader(getUser())
+})
+
+const useLinkedQty = computed(() => !!targetQty.value)
+
+const defectQtySnapshot = reactive({ goodQty: 0, defectQty: 0 })
+
+function resolveProductId() {
+  if (context.productId) return context.productId
+  if (!productCode.value) return ''
+  const product = getQuickProductByCode(productCode.value)
+  if (!product) return ''
+  context.productId = product.id
+  return product.id
+}
+
+function nowTime() {
+  const d = new Date()
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+function onRemoveOrder() {
+  uni.showToast({ title: '至少保留一条任务', icon: 'none' })
+}
+
+function removeSelectedWorker(name) {
+  if (reportForMembers.value.length <= 1) {
+    uni.showToast({ title: '至少保留一名工人', icon: 'none' })
+    return
+  }
+  reportForMembers.value = reportForMembers.value.filter((n) => n !== name)
+  context.reportFor = reportForMembers.value[0] || context.reportFor
+  form.reporter = context.reportFor
+}
+
+onLoad((query) => {
+  if (query.editId) {
+    editId.value = query.editId
+    const row = getRecordById(query.editId)
+    if (!row) {
+      uni.showToast({ title: '记录不存在', icon: 'none' })
+      setTimeout(() => uni.navigateBack(), 1500)
+      return
+    }
+    if (row.status !== '已拒绝') {
+      uni.showToast({ title: '仅已拒绝记录可重新编辑', icon: 'none' })
+      setTimeout(() => uni.navigateBack(), 1500)
+      return
+    }
+    loadFromRecord(row)
+    return
+  }
+
+  processName.value = decodeURIComponent(query.processName || '')
+  productName.value = decodeURIComponent(query.productName || '')
+  productCode.value = query.productCode || ''
+  specModel.value = query.specModel ? decodeURIComponent(query.specModel) : ''
+  material.value = query.material ? decodeURIComponent(query.material) : ''
+  drawingNo.value = query.drawingNo ? decodeURIComponent(query.drawingNo) : ''
+  targetQty.value = query.targetQty ? Number(query.targetQty) : null
+  remainingQty.value = query.remainingQty != null ? Number(query.remainingQty) : targetQty.value
+  context.source = query.source || 'quick'
+  context.productId = query.productId || ''
+  context.taskId = query.taskId || ''
+  context.taskNo = query.taskNo || ''
+  context.workOrderNo = query.workOrderNo || ''
+  context.workOrderId = query.workOrderId || ''
+  context.processId = query.processId || ''
+  context.groupName = query.groupName ? decodeURIComponent(query.groupName) : ''
+  context.reportFor = query.reportFor ? decodeURIComponent(query.reportFor) : ''
+  context.isGroupTask = query.isGroupTask === '1'
+  context.salesOrderNo = query.salesOrderNo ? decodeURIComponent(query.salesOrderNo) : ''
+  reportForMembers.value = query.reportForMembers
+    ? decodeURIComponent(query.reportForMembers)
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : []
+  collaborationLabel.value = query.collaborationLabel
+    ? decodeURIComponent(query.collaborationLabel)
+    : ''
+
+  reportMode.value = query.reportMode || getProcessReportMode(processName.value)
+  defectItems.value = getProcessDefectItems(processName.value)
+  resolveProductId()
+  initTaskOperator()
+  if (context.taskId) {
+    collaborationPeers.value = getCollaborationPeers(context.taskId)
+    if (!collaborationLabel.value && collaborationPeers.value.length > 1) {
+      const self = collaborationPeers.value.find((p) => p.id === context.taskId)
+      if (self?.collaborationSlot) {
+        collaborationLabel.value = `协作 ${self.collaborationSlot}/${collaborationPeers.value.length}`
+      }
+    }
+    applyWorkItemSnapshotFromTask(getTaskById(context.taskId))
+  }
+  fillMissingProductMeta()
+  form.startTime = nowTime()
+  form.endTime = nowTime()
+  if (targetQty.value && isScheduleMode.value) {
+    const pending = Math.max(0, Number(remainingQty.value ?? targetQty.value) || 0)
+    form.goodQty = pending
+    form.finishedQty = pending
+    refreshQtySnapshot()
+  }
+})
+
+onShow(() => {
+  const picked = consumeSelectionResult('processOperator')
+  if (picked?.operator) {
+    form.operator = picked.operator
+    if (!isProxyMode.value) {
+      form.reporter = picked.operator
+    }
+  }
+})
+
+function initTaskOperator() {
+  if (context.source !== 'workorder') return
+  const user = getUser()
+  const leaderName = resolveWorkerDisplayName(user)
+  const reportFor = context.reportFor || leaderName
+  if (!context.groupName) {
+    const groups = getUserWorkerGroupNames(user)
+    context.groupName = groups[0] || ''
+  }
+  if (isProxyMode.value) {
+    form.reporter = reportFor
+    form.operator = leaderName
+    return
+  }
+  const defaultName = reportFor || leaderName
+  if (!form.operator) form.operator = defaultName
+  form.reporter = form.operator
+  const allowed = getGroupWorkerNames(context.groupName)
+  if (form.operator && allowed.length && !allowed.includes(form.operator)) {
+    form.operator = allowed.includes(defaultName) ? defaultName : allowed[0] || ''
+    form.reporter = form.operator
+  }
+}
+
+function goSelectOperator() {
+  if (!context.groupName) {
+    uni.showToast({ title: '未找到工人小组', icon: 'none' })
+    return
+  }
+  const selected = form.operator ? [form.operator] : []
+  const q = [
+    'scope=group',
+    `groupName=${encodeURIComponent(context.groupName)}`,
+    'mode=single',
+    'selectionType=processOperator',
+    `selected=${encodeURIComponent(JSON.stringify(selected))}`,
+  ].join('&')
+  uni.navigateTo({ url: `/pages/quick-report/personnel-select?${q}` })
+}
+
+function fillMissingProductMeta() {
+  const task = context.taskId ? getTaskById(context.taskId) : null
+  const source = {
+    ...(task || {}),
+    productCode: productCode.value || task?.itemCode || task?.productCode || '',
+    specModel: specModel.value,
+    material: material.value,
+    drawingNo: drawingNo.value,
+    salesOrderNo: context.salesOrderNo,
+    workOrderNo: context.workOrderNo || task?.workOrderCode || '',
+    workOrderCode: context.workOrderNo || task?.workOrderCode || '',
+  }
+  const meta = resolveProductMeta(source)
+  specModel.value = meta.specModel
+  material.value = meta.material
+  drawingNo.value = meta.drawingNo
+  if (!context.salesOrderNo) context.salesOrderNo = resolveSalesOrderNo(source)
+}
+
+function loadFromRecord(row) {
+  processName.value = row.processName || ''
+  productName.value = row.productName || ''
+  productCode.value = row.productCode || ''
+  specModel.value = row.specModel || ''
+  material.value = row.material || ''
+  drawingNo.value = row.drawingNo || ''
+  targetQty.value = row.targetQty ?? null
+  context.source = row.source || 'quick'
+  context.productId = row.productId || ''
+  context.taskId = row.taskId || ''
+  context.taskNo = row.taskNo || ''
+  context.workOrderNo = row.workOrderNo || ''
+  context.workOrderId = row.workOrderId || ''
+  context.processId = row.processId || ''
+  context.groupName = row.groupName || ''
+  context.salesOrderNo = row.salesOrderNo || ''
+
+  reportMode.value = row.reportMode || getProcessReportMode(processName.value)
+  reportQtyMode.value = normalizeReportQtyMode(row.reportQtyMode)
+  wageQtyMode.value = normalizeWageQtyMode(row.wageQtyMode)
+  defectItems.value = getProcessDefectItems(processName.value)
+  resolveProductId()
+
+  form.goodQty = Number(row.goodQty) || 0
+  form.defectQty = Number(row.defectQty) || 0
+  form.finishedQty = Number(row.finishedQty) || 0
+  form.workHours = row.workHours != null ? Number(row.workHours) : 4.5
+  form.startTime = row.startTime || nowTime()
+  form.endTime = row.endTime || nowTime()
+  form.defectBreakdown = ensureDefectBreakdown(row, defectItems.value)
+  form.remark = row.remark || ''
+  form.operator = row.operator || ''
+  form.reporter = row.reporter || row.operator || ''
+  form.images = Array.isArray(row.images) ? [...row.images] : []
+  form.workItems = normalizeReportWorkItems(row.workItems || [], row.workItems || []).map((r) => ({
+    ...r,
+    plannedQtyTotal: null,
+  }))
+  applyDefectLegacy()
+  refreshQtySnapshot()
+  initTaskOperator()
+  fillMissingProductMeta()
+}
+
+function applyWorkItemSnapshotFromTask(task) {
+  if (!task) return
+  reportQtyMode.value = normalizeReportQtyMode(task.reportQtyMode)
+  wageQtyMode.value = normalizeWageQtyMode(task.wageQtyMode)
+  if (Array.isArray(task.workItems) && task.workItems.length) {
+    const mode = resolveWorkItemEntryMode(
+      reportQtyMode.value,
+      wageQtyMode.value,
+      true,
+    )
+    form.workItems = buildWorkItemFormRows(task.workItems, mode)
+  } else {
+    form.workItems = []
+  }
+}
+
+function changeWorkItemQty(index, delta) {
+  const row = form.workItems[index]
+  if (!row) return
+  row.qty = Math.max(0, (Number(row.qty) || 0) + delta)
+  row.selected = row.qty > 0
+}
+
+function toggleWorkItemSelected(index) {
+  const row = form.workItems[index]
+  if (!row) return
+  row.selected = !row.selected
+  if (!row.selected) row.qty = 0
+}
+
+function refreshQtySnapshot() {
+  defectQtySnapshot.goodQty = Math.max(0, Number(form.goodQty) || 0)
+  defectQtySnapshot.defectQty = Math.max(0, Number(form.defectQty) || 0)
+}
+
+function syncDefectBreakdown() {
+  if (Number(form.defectQty) <= 0) {
+    form.defectBreakdown = []
+  } else {
+    form.defectBreakdown = syncDefectBreakdownOnQtyChange(
+      { defectQty: form.defectQty, defectBreakdown: form.defectBreakdown },
+      defectItems.value,
+    )
+  }
+  applyDefectLegacy()
+}
+
+function changeQty(field, delta) {
+  if (useLinkedQty.value) {
+    applyLinkedSingleQtyChange(form, field, delta)
+    form.finishedQty = (Number(form.goodQty) || 0) + (Number(form.defectQty) || 0)
+    refreshQtySnapshot()
+    if (field === 'defect') syncDefectBreakdown()
+    return
+  }
+  const key = field === 'good' ? 'goodQty' : 'defectQty'
+  form[key] = Math.max(0, (Number(form[key]) || 0) + delta)
+  if (field === 'defect') syncDefectBreakdown()
+}
+
+function onDefectQtyFocus() {
+  if (!useLinkedQty.value) return
+  refreshQtySnapshot()
+}
+
+function onDefectQtyBlur() {
+  if (useLinkedQty.value) {
+    applyLinkedSingleQtyFromDefect(form, defectQtySnapshot)
+    form.finishedQty = (Number(form.goodQty) || 0) + (Number(form.defectQty) || 0)
+    refreshQtySnapshot()
+  }
+  syncDefectBreakdown()
+}
+
+function changeHours(delta) {
+  form.workHours = Math.max(0, (Number(form.workHours) || 0) + delta)
+}
+
+function onDefectBreakdownUpdate(breakdown) {
+  form.defectBreakdown = breakdown
+  applyDefectLegacy()
+}
+
+function applyDefectLegacy() {
+  Object.assign(form, breakdownToLegacy(form.defectBreakdown))
+}
+
+function onStartChange(e) {
+  form.startTime = e.detail.value
+}
+
+function onEndChange(e) {
+  form.endTime = e.detail.value
+}
+
+function onNavBack() {
+  if (editId.value) {
+    uni.navigateBack()
+    return
+  }
+  if (isQuickSource.value) {
+    goQuickProcessStep()
+    return
+  }
+  uni.navigateBack()
+}
+
+function goQuickProcessStep() {
+  const productId = resolveProductId()
+  if (!productId) {
+    uni.redirectTo({ url: '/pages/process-report/index?tab=quick' })
+    return
+  }
+  const q = [
+    `productId=${encodeURIComponent(productId)}`,
+    `processName=${encodeURIComponent(processName.value)}`,
+  ]
+  if (editId.value) q.push(`editId=${encodeURIComponent(editId.value)}`)
+  uni.redirectTo({ url: `/pages/process-report/quick-process?${q.join('&')}` })
+}
+
+function onPrevStep() {
+  if (isQuickSource.value) {
+    goQuickProcessStep()
+    return
+  }
+  uni.navigateBack()
+}
+
+onBackPress(() => {
+  if (editId.value) return false
+  if (isQuickSource.value) {
+    onNavBack()
+    return true
+  }
+  return false
+})
+
+function onSubmit() {
+  if (submitting.value) return
+  if (!isQuickSource.value) {
+    if (!form.reporter && !form.operator) {
+      uni.showToast({ title: '请选择执行人', icon: 'none' })
+      return
+    }
+    if (!isProxyMode.value) {
+      const allowed = getGroupWorkerNames(context.groupName)
+      if (allowed.length && !allowed.includes(form.operator)) {
+        uni.showToast({ title: '执行人不在当前工人小组', icon: 'none' })
+        return
+      }
+    }
+  }
+  const defectErr = validateDefectBreakdown(
+    form.defectQty,
+    form.defectBreakdown,
+    defectItems.value,
+  )
+  if (defectErr) {
+    uni.showToast({ title: defectErr, icon: 'none' })
+    return
+  }
+  if (workItemEntryMode.value !== 'none') {
+    const workCheck = validateReportWorkItems({
+      reportQtyMode: reportQtyMode.value,
+      wageQtyMode: wageQtyMode.value,
+      workItems: form.workItems,
+      catalog: form.workItems,
+    })
+    if (!workCheck.ok) {
+      uni.showToast({ title: workCheck.message, icon: 'none' })
+      return
+    }
+  }
+  // 排产报工 / 分项+报工：必须填总报工数（良品+不良）
+  if (!isQuickSource.value && showPieceQtyFields.value) {
+    const total = (Number(form.goodQty) || 0) + (Number(form.defectQty) || 0)
+    if (total <= 0) {
+      uni.showToast({ title: '请填写报工数量', icon: 'none' })
+      return
+    }
+    if (isScheduleMode.value && remainingQty.value != null && total > remainingQty.value) {
+      uni.showToast({ title: `报工数量不能超过待报 ${remainingQty.value} 件`, icon: 'none' })
+      return
+    }
+  }
+  submitting.value = true
+  const legacy = breakdownToLegacy(form.defectBreakdown)
+  let workItemsPayload = []
+  if (workItemEntryMode.value === 'qty') {
+    workItemsPayload = normalizeReportWorkItems(form.workItems, form.workItems)
+  } else if (workItemEntryMode.value === 'select') {
+    workItemsPayload = normalizeReportWorkItems(form.workItems, form.workItems).filter(
+      (r) => r.selected,
+    )
+  }
+  const goodQty = form.goodQty
+  const payload = {
+    ...context,
+    productId: resolveProductId(),
+    processName: processName.value,
+    productName: productName.value,
+    productCode: productCode.value,
+    specModel: specModel.value,
+    material: material.value,
+    drawingNo: drawingNo.value,
+    salesOrderNo: context.salesOrderNo,
+    targetQty: targetQty.value,
+    reportMode: reportMode.value,
+    reportQtyMode: reportQtyMode.value,
+    wageQtyMode: wageQtyMode.value,
+    workItems: workItemsPayload,
+    goodQty,
+    defectQty: form.defectQty,
+    finishedQty: (Number(goodQty) || 0) + (Number(form.defectQty) || 0),
+    workHours: form.workHours,
+    startTime: form.startTime,
+    endTime: form.endTime,
+    defectBreakdown: legacy.defectBreakdown,
+    defectItemIds: legacy.defectItemIds,
+    defectItemNames: legacy.defectItemNames,
+    defectReasonLabel: legacy.defectReasonLabel,
+    remark: form.remark,
+    images: [...(form.images || [])],
+    operator: isQuickSource.value ? '' : form.operator,
+    reporter: isQuickSource.value ? '' : (form.reporter || form.operator),
+    taskScope: isQuickSource.value ? '' : (context.isGroupTask ? '小组' : '个人'),
+    groupName: isQuickSource.value ? '' : context.groupName,
+  }
+  const res = editId.value
+    ? resubmitProcessReport(editId.value, payload)
+    : submitProcessReport(payload)
+  submitting.value = false
+  if (!res.ok) {
+    uni.showToast({ title: res.message, icon: 'none' })
+    return
+  }
+  if (!editId.value && context.taskId) {
+    markTaskReported(context.taskId, {
+      goodQty: form.goodQty,
+      defectQty: form.defectQty,
+    })
+  }
+  uni.showToast({ title: res.message, icon: 'none', duration: 2000 })
+  setTimeout(() => {
+    if (editId.value) {
+      uni.redirectTo({ url: '/pages/process-report/index?tab=records' })
+      return
+    }
+    if (context.source === 'workorder') {
+      uni.navigateBack()
+    } else {
+      uni.redirectTo({ url: '/pages/process-report/index?tab=records' })
+    }
+  }, 2000)
+}
+</script>
+
+<style lang="scss" scoped>
+$primary: #1677ff;
+
+.execute-page {
+  min-height: 100vh;
+  background: #f5f6f8;
+  padding: 0 24rpx 160rpx;
+}
+
+.custom-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(env(safe-area-inset-top, 0px) + 12rpx) 0 20rpx;
+  background: #f5f6f8;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.nav-back {
+  width: 72rpx;
+  height: 72rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.back-arrow {
+  font-size: 52rpx;
+  color: $primary;
+  line-height: 1;
+  font-weight: 300;
+}
+
+.nav-title {
+  font-size: 34rpx;
+  font-weight: 700;
+  color: #1a1a1a;
+}
+
+.nav-placeholder {
+  width: 72rpx;
+}
+
+.sub-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16rpx;
+  margin-bottom: 12rpx;
+}
+
+.sub-title {
+  flex: 1;
+  font-size: 26rpx;
+  color: #8c8c8c;
+}
+
+.order-delete {
+  flex-shrink: 0;
+  font-size: 26rpx;
+  color: #bfbfbf;
+  padding: 4rpx 8rpx;
+}
+
+.workers-banner {
+  background: #fff;
+  border-radius: 16rpx;
+  padding: 20rpx 24rpx;
+  margin-bottom: 20rpx;
+  border: 1rpx solid #e6f4ff;
+}
+
+.workers-label {
+  display: block;
+  font-size: 24rpx;
+  color: #8c8c8c;
+  margin-bottom: 12rpx;
+}
+
+.workers-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12rpx;
+}
+
+.worker-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8rpx;
+  padding: 8rpx 16rpx 8rpx 20rpx;
+  border-radius: 28rpx;
+  background: #e6f4ff;
+  color: #1677ff;
+  font-size: 26rpx;
+  font-weight: 500;
+}
+
+.worker-chip-x {
+  font-size: 28rpx;
+  line-height: 1;
+  color: #69b1ff;
+}
+
+.workers-hint {
+  display: block;
+  margin-top: 12rpx;
+  font-size: 22rpx;
+  color: #fa8c16;
+}
+
+.collab-tag {
+  margin-left: 12rpx;
+  font-size: 22rpx;
+  color: #531dab;
+  background: #f9f0ff;
+  padding: 4rpx 12rpx;
+  border-radius: 8rpx;
+}
+
+.collab-card {
+  background: #fff;
+  border-radius: 16rpx;
+  padding: 20rpx 24rpx;
+  margin-bottom: 16rpx;
+}
+
+.collab-title {
+  display: block;
+  font-size: 26rpx;
+  font-weight: 600;
+  color: #262626;
+  margin-bottom: 12rpx;
+}
+
+.collab-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 24rpx;
+  padding: 8rpx 0;
+}
+
+.collab-name {
+  color: #595959;
+}
+
+.collab-status {
+  color: #fa8c16;
+
+  &.done {
+    color: #52c41a;
+  }
+}
+
+.product-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8rpx 20rpx;
+  margin-bottom: 16rpx;
+  font-size: 24rpx;
+  color: #595959;
+}
+
+.meta-item {
+  line-height: 1.5;
+}
+
+.mode-tags {
+  display: flex;
+  align-items: center;
+  gap: 12rpx;
+  margin-bottom: 20rpx;
+}
+
+.mode-tag {
+  display: inline-block;
+  padding: 6rpx 16rpx;
+  background: #e6f4ff;
+  color: $primary;
+  border-radius: 8rpx;
+  font-size: 22rpx;
+}
+
+.source-tag {
+  display: inline-block;
+  padding: 6rpx 16rpx;
+  background: #f6ffed;
+  color: #52c41a;
+  border-radius: 8rpx;
+  font-size: 22rpx;
+}
+
+.card {
+  background: #fff;
+  border-radius: 20rpx;
+  padding: 28rpx;
+}
+
+.card-title {
+  display: block;
+  font-size: 32rpx;
+  font-weight: 700;
+  margin-bottom: 24rpx;
+}
+
+.target-bar {
+  display: flex;
+  justify-content: space-between;
+  gap: 20rpx;
+  padding: 20rpx 24rpx;
+  background: #e6f4ff;
+  border-radius: 12rpx;
+  margin-bottom: 28rpx;
+}
+
+.target-item {
+  flex: 1;
+  font-size: 26rpx;
+  color: #595959;
+
+  &.highlight .target-num {
+    color: #fa8c16;
+  }
+}
+
+.target-num {
+  display: block;
+  margin-top: 8rpx;
+  font-size: 36rpx;
+  font-weight: 700;
+  color: $primary;
+}
+
+.work-item-tag {
+  background: #fff7e6;
+  color: #d46b08;
+}
+
+.work-items-block {
+  margin-bottom: 28rpx;
+  padding: 20rpx;
+  background: #fafafa;
+  border-radius: 12rpx;
+}
+
+.work-items-title {
+  display: block;
+  font-size: 28rpx;
+  font-weight: 600;
+  margin-bottom: 16rpx;
+  color: #262626;
+}
+
+.work-item-row {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  margin-bottom: 16rpx;
+}
+
+.work-item-select-row {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  margin-bottom: 16rpx;
+  padding: 12rpx 0;
+}
+
+.work-item-check {
+  width: 40rpx;
+  height: 40rpx;
+  border: 2rpx solid #d9d9d9;
+  border-radius: 8rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24rpx;
+  color: #fff;
+  flex-shrink: 0;
+
+  &.on {
+    background: #1677ff;
+    border-color: #1677ff;
+  }
+}
+
+.work-item-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.work-item-name {
+  display: block;
+  font-size: 28rpx;
+  color: #262626;
+}
+
+.work-item-hint {
+  display: block;
+  margin-top: 4rpx;
+  font-size: 22rpx;
+  color: #8c8c8c;
+}
+
+.field {
+  margin-bottom: 28rpx;
+}
+
+.label {
+  display: block;
+  font-size: 26rpx;
+  color: #595959;
+  margin-bottom: 12rpx;
+}
+
+.label.required::before {
+  content: '*';
+  color: #ff4d4f;
+  margin-right: 4rpx;
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+}
+
+.step-btn {
+  width: 72rpx;
+  height: 72rpx;
+  line-height: 72rpx;
+  text-align: center;
+  background: #f5f5f5;
+  border-radius: 12rpx;
+  font-size: 36rpx;
+  color: #595959;
+}
+
+.step-btn.primary {
+  background: $primary;
+  color: #fff;
+}
+
+.step-val {
+  flex: 1;
+  text-align: center;
+  font-size: 56rpx;
+  font-weight: 700;
+  color: $primary;
+  height: 80rpx;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16rpx;
+}
+
+.chip {
+  padding: 12rpx 28rpx;
+  border: 2rpx solid #d9d9d9;
+  border-radius: 32rpx;
+  font-size: 26rpx;
+  color: #595959;
+}
+
+.chip.active {
+  border-color: $primary;
+  color: $primary;
+  background: #e6f4ff;
+}
+
+.time-row {
+  display: flex;
+  gap: 24rpx;
+  margin-bottom: 28rpx;
+}
+
+.time-col {
+  flex: 1;
+}
+
+.time-box {
+  margin-top: 12rpx;
+  padding: 20rpx;
+  background: #f5f5f5;
+  border-radius: 12rpx;
+  text-align: center;
+  font-size: 32rpx;
+  color: #1a1a1a;
+}
+
+.remark {
+  width: 100%;
+  min-height: 120rpx;
+  padding: 16rpx;
+  background: #f5f5f5;
+  border-radius: 12rpx;
+  font-size: 28rpx;
+  box-sizing: border-box;
+}
+
+.readonly-field .readonly-val {
+  display: block;
+  padding: 20rpx 24rpx;
+  background: #f5f5f5;
+  border-radius: 12rpx;
+  font-size: 28rpx;
+  color: #262626;
+}
+
+.operator-field .operator-picker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20rpx 24rpx;
+  background: #f5f5f5;
+  border-radius: 12rpx;
+}
+
+.operator-picker .placeholder {
+  color: #bfbfbf;
+}
+
+.operator-picker .arrow {
+  color: #bfbfbf;
+  font-size: 32rpx;
+}
+
+.field-hint {
+  display: block;
+  margin-top: 8rpx;
+  font-size: 22rpx;
+  color: #8c8c8c;
+}
+
+.foot {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  gap: 20rpx;
+  padding: 20rpx 24rpx 40rpx;
+  background: #fff;
+  box-shadow: 0 -4rpx 20rpx rgba(0, 0, 0, 0.06);
+}
+
+.btn {
+  flex: 1;
+  height: 88rpx;
+  line-height: 88rpx;
+  border-radius: 44rpx;
+  font-size: 30rpx;
+  margin: 0;
+  border: none;
+}
+
+.btn.cancel {
+  background: #fff;
+  color: #1a1a1a;
+  border: 2rpx solid #d9d9d9;
+}
+
+.btn.submit {
+  background: $primary;
+  color: #fff;
+}
+</style>

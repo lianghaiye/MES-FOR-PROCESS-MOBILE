@@ -1,0 +1,105 @@
+/** 与 WEB 端 localStorage 键名对齐的种子数据 */
+
+export const DEFECT_ITEMS_KEY = 'i_doms_defect_items'
+export const PROCESS_CONFIG_KEY = 'i_doms_process_config'
+export const DEFECT_SEED_VERSION = 'i_doms_defect_items_seed_v'
+export const PROCESS_SEED_VERSION = 'i_doms_process_config_seed_v'
+
+export function createDefectItemSeed() {
+  return [
+    { id: 'di-1', code: 'qita', name: '其他', createdAt: '2025-12-31' },
+    { id: 'di-2', code: 'BL202512310001', name: '有气孔', createdAt: '2025-12-31' },
+    { id: 'di-3', code: 'BL202512310002', name: '有沙眼', createdAt: '2025-12-31' },
+    { id: 'di-4', code: 'BL202512310003', name: '焊渣', createdAt: '2026-01-05' },
+    { id: 'di-5', code: 'BL202512310004', name: '气孔', createdAt: '2026-01-05' },
+    { id: 'di-6', code: 'BL202512310005', name: '尺寸超差', createdAt: '2026-01-05' },
+    { id: 'di-7', code: 'BL202512310006', name: '表面划伤', createdAt: '2026-01-08' },
+    { id: 'di-8', code: 'BL202512310007', name: '硬度不合格', createdAt: '2026-01-10' },
+  ]
+}
+
+const PROCESS_DEFECT_MAP = {
+  点焊: ['di-4', 'di-5', 'di-6'],
+  打磨: ['di-6', 'di-7'],
+  装配: ['di-1', 'di-7'],
+  车削: ['di-2', 'di-3', 'di-6'],
+  铣削: ['di-3', 'di-6'],
+  热处理: ['di-8', 'di-1'],
+  粗车: ['di-2', 'di-3'],
+  精车: ['di-6', 'di-7'],
+  机加工: ['di-2', 'di-6'],
+  领料: ['di-1', 'di-7'],
+  调试: ['di-1', 'di-8'],
+  试验: ['di-1', 'di-8'],
+  磨削: ['di-6', 'di-7'],
+  喷涂: ['di-5', 'di-7'],
+  总装: ['di-1', 'di-7'],
+  轴承装配: ['di-6', 'di-7'],
+  预装: ['di-3', 'di-6'],
+}
+
+const PROCESS_REPORT_MODE = {
+  点焊: '批量计件',
+  打磨: '批量计件',
+  装配: '时长报工',
+  车削: '批量计件',
+  铣削: '批量计件',
+  热处理: '时长报工',
+  粗车: '批量计件',
+  精车: '批量计件',
+  机加工: '批量计件',
+  领料: '批量计件',
+  调试: '时长报工',
+  检验: '时长报工',
+  试验: '时长报工',
+  磨削: '批量计件',
+  喷涂: '批量计件',
+  总装: '批量计件',
+  轴承装配: '批量计件',
+  预装: '批量计件',
+  入库: '时长报工',
+}
+
+function padCode(n) {
+  return `GX${String(n).padStart(8, '0')}`
+}
+
+export function createProcessConfigSeed() {
+  const names = [
+    '点焊', '打磨', '装配', '车削', '铣削', '热处理', '粗车', '精车',
+    '机加工', '领料', '调试', '检验', '试验', '磨削', '喷涂', '总装', '轴承装配', '预装',
+    '下料', '钻孔', '质检', '入库',
+  ]
+  return names.map((name, i) => ({
+    id: `proc-m-${String(i + 1).padStart(3, '0')}`,
+    code: padCode(i + 1),
+    name,
+    category: name === '试验' || name === '调试' || name === '检验' || name === '装配' ? '组装' : '机械',
+    resourceType:
+      name === '试验' || name === '调试' || name === '检验' || name === '装配' || name === '拆解'
+        ? '工人小组'
+        : '工人',
+    position: '机加工岗',
+    status: '使用中',
+    reportMode: PROCESS_REPORT_MODE[name] || '',
+    taskExecutionMode:
+      name === '试验' || name === '调试' || name === '检验' || name === '热处理'
+        ? 'collaborative'
+        : 'single_claim',
+    defectItemIds: [...(PROCESS_DEFECT_MAP[name] || [])],
+    defaultExecutors: [],
+    createdAt: '2026-05-01',
+    updatedAt: '2026-06-01',
+  }))
+}
+
+export function ensureIodomsSeed() {
+  if (uni.getStorageSync(DEFECT_SEED_VERSION) !== '1') {
+    uni.setStorageSync(DEFECT_ITEMS_KEY, JSON.stringify({ items: createDefectItemSeed() }))
+    uni.setStorageSync(DEFECT_SEED_VERSION, '1')
+  }
+  if (uni.getStorageSync(PROCESS_SEED_VERSION) !== '7') {
+    uni.setStorageSync(PROCESS_CONFIG_KEY, JSON.stringify({ processes: createProcessConfigSeed() }))
+    uni.setStorageSync(PROCESS_SEED_VERSION, '7')
+  }
+}

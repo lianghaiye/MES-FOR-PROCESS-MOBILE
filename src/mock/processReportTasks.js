@@ -1,0 +1,538 @@
+/**
+ * 工序报工 - 待领任务 / 今日待报工（按任务取值）
+ * 工单 1:N 任务，每条任务对应一道工序
+ */
+
+import { formatReportDate, getMyRecords, submitProcessReport } from './processReportRecords'
+import {
+  mergePcSyncedTasks,
+  getAllTasks,
+  updateTaskById,
+  claimTask,
+  getTaskById,
+  getTasksByProcessGroup,
+  unlockNextSerialTask,
+} from './disassemblyTasks'
+import { getProcessReportMode } from '@/utils/iodomsStorage'
+import { resolveLaborConfig } from '@/utils/laborWageCalc'
+import { isDurationReportMode } from '@/utils/reportMode'
+import { isParallelTaskDispatch } from '@/utils/businessRuleBridge'
+import { updateWorkOrderStatus, markWorkOrderClaimedOnClaim } from '@/utils/workOrderStatusBridge'
+import {
+  resolveWorkerDisplayName,
+  getGroupLeaderName,
+  getGroupWorkerNames,
+  isGroupLeader,
+} from '@/utils/workerGroup'
+import {
+  REPORTABLE_TASK_STATUS,
+  getTaskAssignGroups,
+  isMultiGroupTask,
+  isGroupReportTask,
+  isPersonalLeaderTask,
+  isGroupTaskReadyForLeader,
+  getTaskReportedTotal,
+  getTaskRemainingQty,
+  isCollaborativeTask,
+} from '@/utils/processReportTaskRules'
+import { resolveProductMeta, resolveSalesOrderNo } from './processReportProductMeta'
+
+const REPORTABLE_CATEGORIES = ['生产工单', '总装工单']
+const AUTO_COMPLETE_CATEGORIES = ['生产工单', '总装工单', '外协工单']
+const ACTIVE_TASK_STATUS = REPORTABLE_TASK_STATUS
+
+function todayStr() {
+  return formatReportDate()
+}
+
+/** 演示环境：admin/管理员 与工人账号 张三 共用报工任务 */
+function resolveExecutorNames(user) {
+  const displayName = user?.displayName || ''
+  const username = user?.username || ''
+  if (displayName === '管理员' || username === 'admin') {
+    return ['管理员', 'admin', '张三']
+  }
+  if (!displayName && !username) return ['张三']
+  return [...new Set([displayName, username].filter(Boolean))]
+}
+
+function isUnclaimedPoolTask(task) {
+  return task.taskStatus === '待领取' && task.placement === 'claim' && !task.claimedBy
+}
+
+function isTaskForUser(task, names) {
+  if (!names.length) return false
+  if (isUnclaimedPoolTask(task)) return false
+  if (task.claimedBy) {
+    return names.some((name) => name === task.claimedBy || name === task.executor)
+  }
+  return names.some(
+    (name) =>
+      task.executor === name ||
+      (task.executors || []).includes(name),
+  )
+}
+
+function isTaskClaimableForUser(task, names) {
+  if (isCollaborativeTask(task)) return false
+  if (task.taskStatus !== '待领取' || task.placement !== 'claim') return false
+  if (isGroupReportTask(task)) {
+    if (!isMultiGroupTask(task)) return false
+    return getTaskAssignGroups(task).some((groupName) => {
+      const leader = getGroupLeaderName(groupName)
+      return leader && names.includes(leader) && !(task.claimedGroups || []).includes(groupName)
+    })
+  }
+  if (task.claimedBy) return false
+  const targets = task.claimTargets?.length ? task.claimTargets : task.executors
+  if (!targets?.length) return false
+  return names.some((name) => targets.includes(name))
+}
+
+function isTaskVisibleToUser(task, names) {
+  if (isGroupReportTask(task)) {
+    return names.some((name) => isGroupTaskReadyForLeader(task, name))
+  }
+  if (task.placement === 'claim' && task.taskStatus === '待领取') return false
+  return isTaskForUser(task, names)
+}
+
+function isTaskForReportMember(task, memberName, leaderName) {
+  if (isPersonalLeaderTask(task, leaderName)) {
+    return memberName === leaderName
+  }
+  if (isGroupReportTask(task) && isGroupTaskReadyForLeader(task, leaderName)) {
+    const groupName = task.groupName || getTaskAssignGroups(task)[0]
+    return getGroupWorkerNames(groupName).includes(memberName)
+  }
+  if (task.claimedBy) return task.claimedBy === memberName || task.executor === memberName
+  return task.executor === memberName || (task.executors || []).includes(memberName)
+}
+
+export function resolveReportContext(user, options = {}, task = null) {
+  const operatorName = resolveWorkerDisplayName(user)
+  const reportForMember = options.reportForMember || operatorName
+  const groupTask = task ? isGroupReportTask(task) : !!options.isGroupTask
+  const proxy = isGroupLeader(user) && groupTask && reportForMember !== operatorName
+  return {
+    operator: proxy ? operatorName : reportForMember,
+    reporter: reportForMember,
+    isProxy: proxy,
+    isGroupTask: !!groupTask,
+  }
+}
+
+function enrichTask(task, user, options = {}) {
+  const reportMode = getProcessReportMode(task.processName) || task.reportMode
+  const productCode = task.itemCode || task.productCode || ''
+  const laborCfg = resolveLaborConfig(productCode, task.processName)
+  const leaderName = resolveWorkerDisplayName(user)
+  const targetQty = task.expectedQty ?? task.targetQty ?? 0
+  const reportedTotalQty = getTaskReportedTotal(task)
+  const remainingQty = getTaskRemainingQty(task)
+  const isGroupTask = isGroupReportTask(task)
+  const isPersonalTask = isPersonalLeaderTask(task, leaderName)
+  const displayTaskStatus =
+    task.controlStatus === '暂停' && task.taskStatus !== '已完成' ? '暂停' : task.taskStatus
+
+  let status = 'pending'
+  if (task.taskStatus === '已完成' || remainingQty <= 0) {
+    status = 'reported'
+  } else if (task.controlStatus === '暂停') {
+    status = 'locked'
+  } else if (task.serialLocked) {
+    status = 'locked'
+  } else if (!REPORTABLE_TASK_STATUS.includes(task.taskStatus) && remainingQty > 0) {
+    status = 'locked'
+  }
+
+  return {
+    ...task,
+    taskStatus: displayTaskStatus,
+    workOrderNo: task.workOrderCode,
+    productCode: task.itemCode || task.productCode || '',
+    targetQty,
+    remainingQty,
+    reportedTotalQty,
+    salesOrderNo: resolveSalesOrderNo(task),
+    groupName: task.groupName || getTaskAssignGroups(task)[0] || '',
+    reportMode,
+    isCollaborative: isCollaborativeTask(task),
+    collaborationLabel: isCollaborativeTask(task)
+      ? `协作 ${task.collaborationSlot || 1}/${task.collaborationTotal || 1}`
+      : '',
+    salaryMethod: laborCfg.salaryMethod,
+    reportTypeLabel: `${laborCfg.reportType}+${laborCfg.salaryMethod}`,
+    status,
+    isGroupTask,
+    isPersonalTask,
+    lockReason: '',
+    reportedGoodQty: Number(task.reportedGoodQty) || 0,
+    reportedDefectQty: Number(task.reportedDefectQty) || 0,
+    reportStatus: remainingQty <= 0 ? task.reportStatus || '待审核' : '',
+    reportRecordId: '',
+    ...resolveProductMeta(task),
+  }
+}
+
+function enrichClaimTask(task) {
+  const groups = getTaskAssignGroups(task)
+  return {
+    ...task,
+    workOrderNo: task.workOrderCode,
+    productCode: task.itemCode || task.productCode || '',
+    targetQty: task.expectedQty ?? task.targetQty ?? 0,
+    salesOrderNo: resolveSalesOrderNo(task),
+    groupName: task.groupName || groups[0] || '',
+    groupNames: groups,
+    isMultiGroup: isMultiGroupTask(task),
+    isCollaborative: isCollaborativeTask(task),
+    reportMode: getProcessReportMode(task.processName) || task.reportMode,
+    ...resolveProductMeta(task),
+  }
+}
+
+export function getCollaborationPeers(taskId) {
+  const task = getTaskById(taskId)
+  if (!task?.workOrderId || !task.processSeq) return []
+  return getTasksByProcessGroup(task.workOrderId, task.processSeq).map((item) => ({
+    id: item.id,
+    executor: item.executor || '',
+    taskStatus: item.taskStatus,
+    collaborationSlot: item.collaborationSlot,
+  }))
+}
+
+function isTaskInTodayScope(task, today) {
+  const created = (task.createdAt || '').slice(0, 10)
+  if (created === today) return true
+  if (ACTIVE_TASK_STATUS.includes(task.taskStatus)) return true
+  if (task.taskStatus === '待领取') return true
+  if (getTaskRemainingQty(task) > 0) return true
+  return false
+}
+
+function isTaskHiddenFromMobile(task) {
+  if (!task) return true
+  if (task.hiddenByTerminate) return true
+  if (task.controlStatus === '终止' && task.taskStatus === '终止') return true
+  return false
+}
+
+export function getClaimableReportTasks(user) {
+  mergePcSyncedTasks()
+  const executorNames = resolveExecutorNames(user)
+  const today = todayStr()
+
+  return getAllTasks()
+    .filter((t) => REPORTABLE_CATEGORIES.includes(t.orderCategory))
+    .filter((t) => !isTaskHiddenFromMobile(t))
+    .filter((t) => !t.serialLocked)
+    .filter((t) => t.controlStatus !== '暂停')
+    .filter((t) => isTaskClaimableForUser(t, executorNames))
+    .filter((t) => isTaskInTodayScope(t, today) || isUnclaimedPoolTask(t))
+    .map(enrichClaimTask)
+    .sort((a, b) => (a.processSeq || 0) - (b.processSeq || 0))
+}
+
+export function getClaimableReportTaskCount(user) {
+  return getClaimableReportTasks(user).length
+}
+
+export function getClaimableReportTaskById(taskId, user) {
+  return getClaimableReportTasks(user).find((t) => t.id === taskId) || null
+}
+
+export function claimReportTask(taskId, user) {
+  const userName = resolveWorkerDisplayName(user)
+  const result = claimTask(taskId, userName)
+  if (result?.ok && result.task?.workOrderId) {
+    markWorkOrderClaimedOnClaim(result.task.workOrderId, result.task.orderCategory || '生产工单')
+  }
+  return result
+}
+
+export function getTodayReportTasks(user, options = {}) {
+  mergePcSyncedTasks()
+  const executorNames = resolveExecutorNames(user)
+  const leaderName = resolveWorkerDisplayName(user)
+  const reportForMember = options.reportForMember || leaderName
+  const today = todayStr()
+
+  return getAllTasks()
+    .filter((t) => REPORTABLE_CATEGORIES.includes(t.orderCategory))
+    .filter((t) => !isTaskHiddenFromMobile(t))
+    .filter((t) => isTaskVisibleToUser(t, executorNames))
+    .filter((t) => {
+      if (isMultiGroupTask(t) && t.placement === 'claim') {
+        return executorNames.some((name) => isGroupTaskReadyForLeader(t, name))
+      }
+      return !(t.placement === 'claim' && t.taskStatus === '待领取' && !isMultiGroupTask(t))
+    })
+    .filter((t) => isTaskInTodayScope(t, today))
+    .filter((t) => {
+      if (isGroupLeader(user)) {
+        const members = Array.isArray(options.reportForMembers) && options.reportForMembers.length
+          ? options.reportForMembers
+          : [reportForMember]
+        return members.some((name) => isTaskForReportMember(t, name, leaderName))
+      }
+      return isTaskForUser(t, [reportForMember])
+    })
+    .map((t) => enrichTask(t, user, { reportForMember }))
+    .filter((t) => t.status !== 'locked' || t.taskStatus === '暂停')
+    .sort((a, b) => {
+      const order = { pending: 0, reported: 1, locked: 2 }
+      const diff = (order[a.status] ?? 9) - (order[b.status] ?? 9)
+      if (diff !== 0) return diff
+      return (a.processSeq || 0) - (b.processSeq || 0)
+    })
+}
+
+export function hasTodayReportTasks(user) {
+  return getTodayReportTasks(user).length > 0
+}
+
+export function getPendingReportTaskCount(user) {
+  return getTodayReportTasks(user).filter((t) => t.status === 'pending').length
+}
+
+export function getReportTaskById(taskId, user, options = {}) {
+  const task = getTodayReportTasks(user, options).find((t) => t.id === taskId)
+  return task || null
+}
+
+function isParallelDispatchForWorkOrder(workOrderId) {
+  const tasks = getAllTasks().filter((t) => t.workOrderId === workOrderId)
+  if (!tasks.length) return isParallelTaskDispatch()
+  if (tasks.some((t) => t.dispatchControl === 'parallel')) return true
+  if (tasks.some((t) => t.dispatchControl === 'serial')) return false
+  return isParallelTaskDispatch()
+}
+
+/** 极简报工：全部工序任务报工完成后，工单自动变更为「已完成」 */
+export function tryAutoCompleteWorkOrder(workOrderId) {
+  if (!workOrderId) return false
+  if (!isParallelDispatchForWorkOrder(workOrderId)) return false
+
+  const tasks = getAllTasks().filter((t) => t.workOrderId === workOrderId && !t.hiddenByTerminate)
+  if (!tasks.length) return false
+
+  const category = tasks[0].orderCategory || '生产工单'
+  if (!AUTO_COMPLETE_CATEGORIES.includes(category)) return false
+  if (!tasks.every((t) => t.taskStatus === '已完成')) return false
+
+  return updateWorkOrderStatus(workOrderId, '已完成', category)
+}
+
+export function markTaskReported(taskId, payload = {}) {
+  const task = getTaskById(taskId)
+  if (!task) return null
+  if (task.controlStatus === '暂停') return null
+  if (task.hiddenByTerminate) return null
+
+  if (isCollaborativeTask(task) && isDurationReportMode(task.reportMode || getProcessReportMode(task.processName))) {
+    const finishedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+    const patch = {
+      reportedGoodQty: Number(payload.goodQty) || 0,
+      reportedDefectQty: Number(payload.defectQty) || 0,
+      reportedFinishedQty: (Number(payload.goodQty) || 0) + (Number(payload.defectQty) || 0),
+      reportStatus: '待审核',
+      taskStatus: '已完成',
+      finishedAt,
+      reportedWorkHours: payload.workHours ?? null,
+    }
+    updateTaskById(taskId, patch)
+    unlockNextSerialTask(task.workOrderId, task.processSeq)
+    tryAutoCompleteWorkOrder(task.workOrderId)
+    return getTaskById(taskId)
+  }
+
+  const addGood = Number(payload.goodQty) || 0
+  const addDefect = Number(payload.defectQty) || 0
+  const reportedGoodQty = (Number(task.reportedGoodQty) || 0) + addGood
+  const reportedDefectQty = (Number(task.reportedDefectQty) || 0) + addDefect
+  const reportedFinishedQty = reportedGoodQty + reportedDefectQty
+  const target = Number(task.expectedQty ?? task.targetQty) || 0
+  const complete = reportedFinishedQty >= target
+  const patch = {
+    reportedGoodQty,
+    reportedDefectQty,
+    reportedFinishedQty,
+    reportStatus: complete ? '待审核' : '',
+    taskStatus: complete ? '已完成' : '待报工',
+  }
+  const updated = updateTaskById(taskId, patch)
+  if (complete && updated) {
+    unlockNextSerialTask(updated.workOrderId, updated.processSeq)
+    tryAutoCompleteWorkOrder(updated.workOrderId)
+  }
+  return updated
+}
+
+function buildBatchReportPayload(task, reportContext) {
+  const remainingQty = Number(task.remainingQty ?? getTaskRemainingQty(task)) || 0
+  const durationMode = isDurationReportMode(task.reportMode)
+  const d = new Date()
+  const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return {
+    source: 'workorder',
+    taskId: task.id,
+    taskNo: task.taskNo,
+    workOrderNo: task.workOrderNo,
+    workOrderId: task.workOrderId,
+    processId: task.id,
+    processName: task.processName,
+    productName: task.productName,
+    productCode: task.productCode,
+    specModel: task.specModel,
+    material: task.material,
+    drawingNo: task.drawingNo,
+    salesOrderNo: task.salesOrderNo,
+    targetQty: task.targetQty,
+    reportMode: task.reportMode,
+    goodQty: remainingQty,
+    defectQty: 0,
+    defectBreakdown: [],
+    workHours: durationMode ? Math.max(0.5, Math.round(remainingQty * 0.5 * 10) / 10) : null,
+    startTime: time,
+    endTime: time,
+    remark: '批量报工',
+    operator: reportContext.operator,
+    reporter: reportContext.reporter,
+    groupName: task.groupName || '',
+    taskScope: task.isGroupTask ? '小组' : '个人',
+    images: [],
+  }
+}
+
+/** 批量报工：按目标数量默认提交（良品=目标，不良=0） */
+export function batchReportTasks(taskIds, user, options = {}) {
+  if (!taskIds?.length) return { ok: false, message: '请选择待报工任务' }
+
+  const pendingMap = new Map(
+    getTodayReportTasks(user, options)
+      .filter((t) => t.status === 'pending')
+      .map((t) => [t.id, t]),
+  )
+
+  let okCount = 0
+  let failCount = 0
+
+  for (const id of taskIds) {
+    const task = pendingMap.get(id)
+    if (!task) continue
+    const reportContext = resolveReportContext(user, options, task)
+    const res = submitProcessReport(buildBatchReportPayload(task, reportContext))
+    if (res.ok) {
+      markTaskReported(task.id, { goodQty: task.remainingQty ?? getTaskRemainingQty(task), defectQty: 0 })
+      okCount += 1
+    } else {
+      failCount += 1
+    }
+  }
+
+  if (!okCount && !failCount) {
+    return { ok: false, message: '没有可报工的任务' }
+  }
+
+  return {
+    ok: okCount > 0,
+    okCount,
+    failCount,
+    message:
+      failCount > 0
+        ? `成功 ${okCount} 项，失败 ${failCount} 项`
+        : `已成功报工 ${okCount} 项`,
+  }
+}
+
+export function getReportTasksByIds(taskIds, user, options = {}) {
+  if (!taskIds?.length) return []
+  const idSet = new Set(taskIds)
+  return getTodayReportTasks(user, options).filter((t) => idSet.has(t.id) && t.status === 'pending')
+}
+
+/** 自主批量报工：按用户填写的各任务数据提交 */
+export function submitBatchCustomReports(entries, user, options = {}) {
+  if (!entries?.length) return { ok: false, message: '没有可提交的数据' }
+
+  const pendingMap = new Map(
+    getTodayReportTasks(user, options)
+      .filter((t) => t.status === 'pending')
+      .map((t) => [t.id, t]),
+  )
+
+  let okCount = 0
+  let failCount = 0
+  let lastMessage = ''
+
+  for (const entry of entries) {
+    const task = pendingMap.get(entry.taskId)
+    if (!task) continue
+    const res = submitProcessReport(entry.payload)
+    if (res.ok) {
+      markTaskReported(task.id, {
+        goodQty: entry.payload.goodQty,
+        defectQty: entry.payload.defectQty,
+      })
+      okCount += 1
+    } else {
+      failCount += 1
+      lastMessage = res.message
+    }
+  }
+
+  if (!okCount && !failCount) {
+    return { ok: false, message: '没有可报工的任务' }
+  }
+
+  return {
+    ok: okCount > 0,
+    okCount,
+    failCount,
+    message:
+      failCount > 0
+        ? lastMessage || `成功 ${okCount} 项，失败 ${failCount} 项`
+        : `已成功报工 ${okCount} 项`,
+  }
+}
+
+export function buildCustomReportPayload(task, form, sharedRemark = '', reportContext = null) {
+  const ctx = reportContext || {
+    operator: task.executor || '',
+    reporter: task.executor || '',
+  }
+  const d = new Date()
+  const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  const remark = [form.remark, sharedRemark].filter(Boolean).join('；') || form.remark || sharedRemark || ''
+  return {
+    source: 'workorder',
+    taskId: task.id,
+    taskNo: task.taskNo,
+    workOrderNo: task.workOrderNo,
+    workOrderId: task.workOrderId,
+    processId: task.id,
+    processName: task.processName,
+    productName: task.productName,
+    productCode: task.productCode,
+    specModel: task.specModel,
+    material: task.material,
+    drawingNo: task.drawingNo,
+    salesOrderNo: task.salesOrderNo,
+    targetQty: task.targetQty,
+    reportMode: task.reportMode,
+    goodQty: Number(form.goodQty) || 0,
+    defectQty: Number(form.defectQty) || 0,
+    defectBreakdown: form.defectBreakdown || [],
+    workHours: isDurationReportMode(task.reportMode) ? Number(form.workHours) || 0 : null,
+    startTime: form.startTime || time,
+    endTime: form.endTime || time,
+    remark: remark || '异常报工',
+    operator: ctx.operator,
+    reporter: ctx.reporter,
+    taskScope: task.isGroupTask ? '小组' : '个人',
+    groupName: task.groupName || '',
+    images: form.images || [],
+  }
+}
